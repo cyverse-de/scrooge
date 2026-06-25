@@ -1,0 +1,33 @@
+[project]
+name = "scrooge"
+version = "0.1.0"
+description = "Supervisor that boots a DuckDB database and serves it over the Quack protocol"
+authors = [
+    { name = "John Wregglesworth", email = "wregglej@arizona.edu" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.5.3",
+]
+
+[project.scripts]
+scrooge = "scrooge.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
