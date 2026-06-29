@@ -45,7 +45,7 @@ wheels = [
 [[package]]
 name = "ducktape"
 version = "0.1.0"
-source = { git = "https://github.com/cyverse-de/ducktape.git#bad7e0ad94b1a48f3124b5a60db320f4243f9a02" }
+source = { git = "https://github.com/cyverse-de/ducktape.git#81da75a6a2acd9f9d3493bb8a809be263e72ba48" }
 dependencies = [
     { name = "fsspec" },
     { name = "python-irodsclient" },
