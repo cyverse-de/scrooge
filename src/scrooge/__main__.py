@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
             env=os.environ,
         )
         token = resolve_token(os.environ)
-        run(config, token=token)
+        run(config, token=token, env=os.environ)
     except ConfigError as exc:
         logging.getLogger("scrooge").error("%s", exc)
         return 2

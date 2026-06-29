@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from scrooge.server import (
     Config,
     ConfigError,
+    _irods_storage_options,
+    _register_filesystems,
     resolve_config,
     resolve_token,
     should_run_schema,
@@ -104,3 +107,44 @@ def test_should_run_schema(
     existed: bool, schema_sql: Path | None, expected: bool
 ) -> None:
     assert should_run_schema(existed=existed, schema_sql=schema_sql) is expected
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, {}),
+        ({"IRODS_HOST": "irods.example.org"}, {"host": "irods.example.org"}),
+        (
+            {
+                "IRODS_HOST": "irods.example.org",
+                "IRODS_PORT": "1247",
+                "IRODS_USER": "rods",
+                "IRODS_ZONE": "tempZone",
+            },
+            {
+                "host": "irods.example.org",
+                "port": 1247,
+                "user": "rods",
+                "zone": "tempZone",
+            },
+        ),
+    ],
+    ids=["env-file-mode", "host-only", "explicit"],
+)
+def test_irods_storage_options(env: dict[str, str], expected: dict[str, Any]) -> None:
+    assert _irods_storage_options(env) == expected
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.registered: list[Any] = []
+
+    def register_filesystem(self, filesystem: Any) -> None:
+        self.registered.append(filesystem)
+
+
+def test_register_filesystems_registers_irods() -> None:
+    con = _RecordingConnection()
+    _register_filesystems(con, {})  # type: ignore[arg-type]
+    assert len(con.registered) == 1
+    assert con.registered[0].protocol == "irods"

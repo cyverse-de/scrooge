@@ -42,6 +42,28 @@ The `--schema-sql` file runs **only** when the database is created fresh. Use it
 one-time schema and seed data. If your setup is purely idempotent DDL
 (`CREATE TABLE IF NOT EXISTS`, ...) it is harmless either way.
 
+### iRODS access (`irods://`)
+
+scrooge registers the [ducktape](https://github.com/cyverse-de/ducktape) fsspec backend
+on the DuckDB connection, so SQL can read and write iRODS data objects via `irods://`
+paths (e.g. `read_parquet('irods:///zone/home/user/data.parquet')`). Registration is
+lazy — no iRODS connection is opened until an `irods://` path is actually used.
+
+Credentials are resolved from the environment. With `IRODS_HOST` set, scrooge connects
+explicitly; otherwise ducktape falls back to the standard iRODS environment file
+(`~/.irods/irods_environment.json` / `.irodsA`).
+
+| Setting     | Environment variable | Default                  |
+| ----------- | -------------------- | ------------------------ |
+| iRODS host  | `IRODS_HOST`         | _(use env file instead)_ |
+| iRODS port  | `IRODS_PORT`         | `1247`                   |
+| iRODS user  | `IRODS_USER`         | _(from env file)_        |
+| iRODS zone  | `IRODS_ZONE`         | _(from env file)_        |
+| iRODS password | `IRODS_PASSWORD`  | _(from `.irodsA`)_       |
+
+Like `QUACK_TOKEN`, `IRODS_PASSWORD` is env-only so the secret is not exposed via process
+arguments.
+
 ## Running
 
 ```bash

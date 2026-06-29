@@ -9,13 +9,16 @@ in SQL.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import duckdb
+import fsspec
 
 logger = logging.getLogger("scrooge")
 
@@ -130,11 +133,52 @@ def _shutdown(con: duckdb.DuckDBPyConnection) -> None:
     con.close()
 
 
-def run(config: Config, *, token: str, stop: threading.Event | None = None) -> None:
+def _irods_storage_options(env: Mapping[str, str]) -> dict[str, Any]:
+    """Build iRODS connection options for ducktape from the environment.
+
+    With IRODS_HOST set, connect explicitly (ducktape reads the password from
+    IRODS_PASSWORD, keeping the secret out of process args and logs); otherwise return
+    no options so ducktape falls back to the standard iRODS environment file.
+    """
+    host = env.get("IRODS_HOST")
+    if not host:
+        return {}
+    options: dict[str, Any] = {"host": host}
+    if env.get("IRODS_PORT"):
+        options["port"] = int(env["IRODS_PORT"])
+    if env.get("IRODS_USER"):
+        options["user"] = env["IRODS_USER"]
+    if env.get("IRODS_ZONE"):
+        options["zone"] = env["IRODS_ZONE"]
+    return options
+
+
+def _register_filesystems(
+    con: duckdb.DuckDBPyConnection, env: Mapping[str, str]
+) -> None:
+    """Register the ducktape iRODS backend so SQL can read/write `irods://` paths.
+
+    The filesystem is lazy: no iRODS connection is opened until an `irods://` path is
+    used, so registering is harmless even when iRODS is never queried.
+    """
+    options = _irods_storage_options(env)
+    con.register_filesystem(fsspec.filesystem("irods", **options))
+    source = "explicit credentials" if options else "iRODS environment file"
+    logger.info("registered iRODS filesystem (irods://) using %s", source)
+
+
+def run(
+    config: Config,
+    *,
+    token: str,
+    env: Mapping[str, str] | None = None,
+    stop: threading.Event | None = None,
+) -> None:
     """Open the database, run setup, start the Quack server, and block until signalled.
 
     Must run on the main thread so the signal handlers can be installed.
     """
+    env = env if env is not None else os.environ
     stop = stop or threading.Event()
     existed = config.database.exists()
     logger.info(
@@ -145,6 +189,7 @@ def run(config: Config, *, token: str, stop: threading.Event | None = None) -> N
     con = duckdb.connect(str(config.database))
     try:
         con.execute("SET VARIABLE quack_token = ?", [token])
+        _register_filesystems(con, env)
         if should_run_schema(existed=existed, schema_sql=config.schema_sql):
             assert config.schema_sql is not None
             logger.info("fresh database; applying schema %s", config.schema_sql)

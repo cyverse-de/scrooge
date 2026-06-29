@@ -8,6 +8,8 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "duckdb>=1.5.3",
+    "ducktape",
+    "fsspec>=2026.6.0",
 ]
 
 [project.scripts]
@@ -31,3 +33,6 @@ venv = ".venv"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+ducktape = { git = "https://github.com/cyverse-de/ducktape.git" }
