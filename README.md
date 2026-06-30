@@ -80,6 +80,51 @@ live table with the Parquet archive, so queries see the full history regardless 
 has been rolled off. Archival is disabled when `SCROOGE_STORAGE_DIR` is unset; `all_logs`
 is then just the live table.
 
+### Archival design
+
+**Sweep loop.** After the Quack server starts, the main thread runs a retention *sweep*
+every `SCROOGE_SWEEP_INTERVAL` seconds until it receives `SIGINT`/`SIGTERM`, then runs one
+final sweep before shutting down. A sweep is best-effort maintenance: any failure (archive
+unreachable, a DuckDB error) is logged and swallowed so it can never take down the live
+ingestion endpoint — the next interval simply retries.
+
+**Rolling algorithm.** Each sweep finds every service whose live row count exceeds
+`SCROOGE_RETENTION_ROWS` and, for each, exports its **oldest day first** to Parquet and
+deletes those rows, repeating until the service is back under the threshold. The most
+recent day is kept live where possible, so recent logs stay queryable without touching the
+archive. Days, not arbitrary row batches, are the unit of eviction so each Parquet file
+holds exactly one service-day.
+
+**File layout.** Files are written as
+`<storage-dir>/<service>/<YYYY-MM-DD>-<NNN>_<service>.parquet`, where `<NNN>` is a
+zero-padded sequence that increments when a day is archived across more than one sweep
+(e.g. late-arriving rows for an already-archived day). The next sequence number is computed
+by **listing** the service directory and matching filenames — not by globbing — so glob
+metacharacters in a service name (`*`, `?`, `[`) can't be misinterpreted and silently
+overwrite an existing file.
+
+**The `all_logs` view.** `all_logs` is a lazy DuckDB view defined as the live `logs` table
+`UNION ALL` a `read_parquet()` over the archive glob (`union_by_name => true`). It is
+(re)created at startup and after any sweep that wrote files, so queries always span live
+plus archived history. When no archive is configured or none exists yet, the view is just
+the live table. The view is a no-op if there is no `logs` table (e.g. a pre-existing
+database, or a custom schema that doesn't define it), so startup never fails on it.
+
+**Ordering and atomicity.** Export is *archive-then-delete*: a day's rows are copied to
+Parquet first, then deleted from the live table. This ordering favors never losing rows. If
+the `COPY` or `DELETE` raises, the just-written Parquet is removed so the still-live rows
+aren't re-archived into a second file (which would double-count in `all_logs`). The one
+residual risk is a hard kill (SIGKILL/OOM) *between* the `COPY` and the `DELETE`: the file
+survives, the rows stay live, and the next sweep re-archives them into a new sequence file —
+duplication in `all_logs`, never loss.
+
+**Concurrency.** Sweeps run on a **dedicated DuckDB connection** (a `cursor()` of the
+serving connection), separate from the one Quack appends on, so no single connection object
+is ever used by two threads. The two connections share the same in-process database
+instance and the registered iRODS filesystem; DuckDB's MVCC arbitrates between Quack's
+appends and the sweep's `COPY`/`DELETE`. A sweep that loses a write–write race just raises
+and is retried on the next interval.
+
 ### iRODS access (`irods://`)
 
 scrooge registers the [ducktape](https://github.com/cyverse-de/ducktape) fsspec backend
