@@ -1,192 +1,173 @@
 # scrooge
 
-A thin supervisor that boots a [DuckDB](https://duckdb.org) database and serves it
-over the [Quack protocol](https://duckdb.org/docs/current/quack/overview) so other
-DuckDB instances can connect over HTTP.
+A log aggregator built on [DuckDB](https://duckdb.org). It collects logs from across a
+cluster into a single DuckDB database, serves that database to other DuckDB instances over
+the [Quack protocol](https://duckdb.org/docs/current/quack/overview), and rolls older
+logs out to [Parquet](https://parquet.apache.org/) in [iRODS](https://irods.org) so the
+live table stays bounded.
 
-Most data logic lives in SQL. The Python process manages the database file lifecycle,
-keeps the server alive, and (when an archive is configured) runs periodic log-retention
-sweeps:
+> **Status: proof of concept — not production-ready.** scrooge is an early prototype under
+> active development. It has been exercised end-to-end against a live iRODS deployment and
+> real Fluent Bit and Quack clients, but it has not been hardened, performance-tuned, or
+> stabilized for production use; configuration and behavior may change without notice. Use
+> it for evaluation and experimentation only.
 
-1. Resolve configuration (CLI flags, with environment-variable fallbacks).
-2. Note whether the database file already exists.
-3. Open the database (DuckDB creates the file if it is missing).
-4. If the database was created fresh, run the schema SQL once (`schema.sql` by default).
-5. Run the boot script (`startup.sql`) on every start — it installs Quack and calls
-   `quack_serve`. The reported listen URI and auth token are logged.
-6. Refresh the `all_logs` view, then sweep retention on each interval tick until
-   `SIGINT`/`SIGTERM`, flush a final sweep, `CHECKPOINT`, and close cleanly.
+## What it does
 
-## Why Python
+scrooge is a thin Python supervisor around an embedded DuckDB. The Python process only
+handles lifecycle and the one bit of data logic SQL can't express (retention); everything
+else lives in SQL.
 
-Quack is a DuckDB core extension as of v1.5.3 (beta; stable targeted for v2.0.0). The
-Go driver (`duckdb/duckdb-go`) currently bundles libduckdb v1.4.1, which predates
-Quack, so it cannot load the extension. Python's `duckdb` package tracks releases and
-supports 1.5.3+ today.
+Logs reach scrooge two ways, both landing in the same `logs` table:
+
+- **[daffy](https://github.com/cyverse-de/daffy)** instances ship logs over the Quack
+  protocol (port `9494`).
+- **[Fluent Bit](https://fluentbit.io)** posts logs to an HTTP endpoint (port `9595`).
+
+A unified `all_logs` view spans the live table plus the Parquet archive, so queries see the
+full history regardless of what has been rolled off.
+
+On startup it:
+
+1. Resolves configuration (CLI flags, with environment-variable fallbacks).
+2. Opens the database (DuckDB creates the file if missing), running the schema SQL once if
+   the database is fresh.
+3. Runs the boot script (`startup.sql`) — installs Quack and calls `quack_serve`.
+4. Starts the HTTP ingest endpoint (if `SCROOGE_INGEST_TOKEN` is set).
+5. Refreshes the `all_logs` view, then sweeps retention every `SCROOGE_SWEEP_INTERVAL`
+   seconds until `SIGINT`/`SIGTERM`, and finally checkpoints and shuts down cleanly.
+
+## Quick start
+
+```bash
+QUACK_TOKEN=super_secret \
+SCROOGE_INGEST_TOKEN=ingest_secret \
+uv run scrooge \
+    --database data/scrooge.duckdb \
+    --schema-sql schema.sql \
+    --storage-dir irods:///zone/home/user/scrooge
+```
+
+- Omit `--storage-dir` to run without archival (the live `logs` table grows unbounded).
+- Omit `SCROOGE_INGEST_TOKEN` to run without the HTTP ingest endpoint.
+
+Both `QUACK_TOKEN` and `SCROOGE_INGEST_TOKEN` are **env-only** (never CLI flags) so the
+secrets aren't visible in `ps`, and must be at least 4 characters.
 
 ## Configuration
 
-| Setting         | Flag               | Environment variable     | Default       |
-| --------------- | ------------------ | ------------------------ | ------------- |
-| Database file   | `--database`       | `DUCKDB_DATABASE`        | _(required)_  |
-| Schema SQL      | `--schema-sql`     | `DUCKDB_SCHEMA_SQL`      | `schema.sql`  |
-| Boot SQL        | `--boot-sql`       | `DUCKDB_BOOT_SQL`        | `startup.sql` |
-| Quack token     | _(none)_           | `QUACK_TOKEN`            | _(required)_  |
-| Archive root    | `--storage-dir`    | `SCROOGE_STORAGE_DIR`    | _(none)_      |
-| Retention rows  | `--retention-rows` | `SCROOGE_RETENTION_ROWS` | `100000`      |
-| Sweep interval  | `--sweep-interval` | `SCROOGE_SWEEP_INTERVAL` | `10.0`        |
-| Ingest token    | _(none)_           | `SCROOGE_INGEST_TOKEN`   | _(unset → off)_ |
-| Ingest host     | `--ingest-host`    | `SCROOGE_INGEST_HOST`    | `0.0.0.0`     |
-| Ingest port     | `--ingest-port`    | `SCROOGE_INGEST_PORT`    | `9595`        |
-| Ingest path     | `--ingest-path`    | `SCROOGE_INGEST_PATH`    | `/logs`       |
-| Ingest service label | `--ingest-service-label-key` | `SCROOGE_INGEST_SERVICE_LABEL_KEY` | `app.kubernetes.io/name` |
+Flags take precedence over environment variables.
 
-Flags take precedence over environment variables. `QUACK_TOKEN` is intentionally
-env-only — secrets passed as CLI flags are visible to anyone who can run `ps`. It is
-**required** and must be at least 4 characters; scrooge fails fast otherwise rather
-than start a server clients cannot authenticate against. scrooge injects it into the
-boot script as the `quack_token` DuckDB variable (the embedded library has no `getenv`),
-which `startup.sql` reads via `getvariable('quack_token')`.
+### Core
 
-The schema SQL file runs **only** when the database is created fresh. It defaults to
-`schema.sql` (which defines the `logs` table; see below). Use it for one-time schema and
-seed data — idempotent DDL (`CREATE TABLE IF NOT EXISTS`, ...) is harmless either way. A
-missing **default** `schema.sql` is tolerated (the server starts without a `logs` table);
-an explicitly configured schema that is missing is a hard error. Set the value to an empty
-string to disable schema execution entirely.
+| Setting       | Flag           | Environment variable | Default       |
+| ------------- | -------------- | -------------------- | ------------- |
+| Database file | `--database`   | `DUCKDB_DATABASE`    | _(required)_  |
+| Schema SQL    | `--schema-sql` | `DUCKDB_SCHEMA_SQL`  | `schema.sql`  |
+| Boot SQL      | `--boot-sql`   | `DUCKDB_BOOT_SQL`    | `startup.sql` |
+| Quack token   | _(env-only)_   | `QUACK_TOKEN`        | _(required)_  |
 
-`SCROOGE_STORAGE_DIR` must be an `irods://` URL or a bare iRODS path — archives are written
-through the registered iRODS backend (see below). `SCROOGE_RETENTION_ROWS` and
-`SCROOGE_SWEEP_INTERVAL` must be positive.
+The schema SQL runs **only** when the database is created fresh. It defaults to
+`schema.sql` (which defines the `logs` table). A missing **default** `schema.sql` is
+tolerated (the server starts without a `logs` table); an explicitly configured schema that
+is missing is a hard error. Set the value to an empty string to disable schema execution.
 
-## Log aggregation & archival
+### Retention / archival
 
-scrooge collects logs shipped by [daffy](https://github.com/cyverse-de/daffy) instances
-over Quack into a `logs` table (defined in `schema.sql`):
+| Setting        | Flag               | Environment variable     | Default       |
+| -------------- | ------------------ | ------------------------ | ------------- |
+| Archive root   | `--storage-dir`    | `SCROOGE_STORAGE_DIR`    | _(none → off)_ |
+| Retention rows | `--retention-rows` | `SCROOGE_RETENTION_ROWS` | `100000`      |
+| Sweep interval | `--sweep-interval` | `SCROOGE_SWEEP_INTERVAL` | `10.0`        |
 
-| Column         | Type        | Notes                          |
-| -------------- | ----------- | ------------------------------ |
-| `capture_time` | `TIMESTAMP` | when the line was captured     |
-| `service`      | `VARCHAR`   | originating service            |
-| `pod`          | `VARCHAR`   | Kubernetes pod (nullable)      |
-| `node`         | `VARCHAR`   | Kubernetes node (nullable)     |
-| `stream`       | `VARCHAR`   | `stdout`/`stderr`              |
-| `level`        | `VARCHAR`   | log level (defaults to `''`)   |
-| `message`      | `VARCHAR`   | the log line                   |
-| `fields`       | `JSON`      | structured fields (nullable)   |
+`SCROOGE_STORAGE_DIR` must be an `irods://` URL or a bare iRODS path; `SCROOGE_RETENTION_ROWS`
+and `SCROOGE_SWEEP_INTERVAL` must be positive.
 
-When `SCROOGE_STORAGE_DIR` is set, scrooge keeps the live table bounded: on each sweep,
-any service whose live row count exceeds `SCROOGE_RETENTION_ROWS` has its oldest log-days
-rolled out (oldest first) to per-service, per-day Parquet files
-(`<storage-dir>/<service>/<YYYY-MM-DD>-<NNN>_<service>.parquet`) and deleted from the
-live table. The archive root is a URL written through the registered filesystem — in
-production an `irods://` path (see below). The `all_logs` view transparently unions the
-live table with the Parquet archive, so queries see the full history regardless of what
-has been rolled off. Archival is disabled when `SCROOGE_STORAGE_DIR` is unset; `all_logs`
-is then just the live table.
+### HTTP ingest (Fluent Bit)
 
-### Archival design
+| Setting             | Flag                          | Environment variable               | Default                  |
+| ------------------- | ----------------------------- | ---------------------------------- | ------------------------ |
+| Ingest token        | _(env-only)_                  | `SCROOGE_INGEST_TOKEN`             | _(none → endpoint off)_  |
+| Bind host           | `--ingest-host`               | `SCROOGE_INGEST_HOST`              | `0.0.0.0`                |
+| Bind port           | `--ingest-port`               | `SCROOGE_INGEST_PORT`              | `9595`                   |
+| Path                | `--ingest-path`               | `SCROOGE_INGEST_PATH`              | `/logs`                  |
+| Service label key   | `--ingest-service-label-key`  | `SCROOGE_INGEST_SERVICE_LABEL_KEY` | `app.kubernetes.io/name` |
 
-**Sweep loop.** After the Quack server starts, the main thread runs a retention *sweep*
-every `SCROOGE_SWEEP_INTERVAL` seconds until it receives `SIGINT`/`SIGTERM`, then runs one
-final sweep before shutting down. A sweep is best-effort maintenance: any failure (archive
-unreachable, a DuckDB error) is logged and swallowed so it can never take down the live
-ingestion endpoint — the next interval simply retries.
-
-**Rolling algorithm.** Each sweep finds every service whose live row count exceeds
-`SCROOGE_RETENTION_ROWS` and, for each, exports its **oldest day first** to Parquet and
-deletes those rows, repeating until the service is back under the threshold. The most
-recent day is kept live where possible, so recent logs stay queryable without touching the
-archive. Days, not arbitrary row batches, are the unit of eviction so each Parquet file
-holds exactly one service-day.
-
-**File layout.** Files are written as
-`<storage-dir>/<service>/<YYYY-MM-DD>-<NNN>_<service>.parquet`, where `<NNN>` is a
-zero-padded sequence that increments when a day is archived across more than one sweep
-(e.g. late-arriving rows for an already-archived day). The next sequence number is computed
-by **listing** the service directory and matching filenames — not by globbing — so glob
-metacharacters in a service name (`*`, `?`, `[`) can't be misinterpreted and silently
-overwrite an existing file.
-
-**The `all_logs` view.** `all_logs` is a lazy DuckDB view defined as the live `logs` table
-`UNION ALL` a `read_parquet()` over the archive glob (`union_by_name => true`). It is
-(re)created at startup and after any sweep that wrote files, so queries always span live
-plus archived history. When no archive is configured or none exists yet, the view is just
-the live table. The view is a no-op if there is no `logs` table (e.g. a pre-existing
-database, or a custom schema that doesn't define it), so startup never fails on it.
-
-**Ordering and atomicity.** Export is *archive-then-delete*: a day's rows are copied to
-Parquet first, then deleted from the live table. This ordering favors never losing rows. If
-the `COPY` or `DELETE` raises, the just-written Parquet is removed so the still-live rows
-aren't re-archived into a second file (which would double-count in `all_logs`). The one
-residual risk is a hard kill (SIGKILL/OOM) *between* the `COPY` and the `DELETE`: the file
-survives, the rows stay live, and the next sweep re-archives them into a new sequence file —
-duplication in `all_logs`, never loss.
-
-**Concurrency.** Sweeps run on a **dedicated DuckDB connection** (a `cursor()` of the
-serving connection), separate from the one Quack appends on, so no single connection object
-is ever used by two threads. The two connections share the same in-process database
-instance and the registered iRODS filesystem; DuckDB's MVCC arbitrates between Quack's
-appends and the sweep's `COPY`/`DELETE`. A sweep that loses a write–write race just raises
-and is retried on the next interval.
-
-### iRODS access (`irods://`)
-
-scrooge registers the [ducktape](https://github.com/cyverse-de/ducktape) fsspec backend
-on the DuckDB connection, so SQL can read and write iRODS data objects via `irods://`
-paths (e.g. `read_parquet('irods:///zone/home/user/data.parquet')`). Registration is
-lazy — no iRODS connection is opened until an `irods://` path is actually used.
+### iRODS
 
 Credentials are resolved from the environment. With `IRODS_HOST` set, scrooge connects
-explicitly; otherwise ducktape falls back to the standard iRODS environment file
-(`~/.irods/irods_environment.json` / `.irodsA`).
+explicitly; otherwise [ducktape](https://github.com/cyverse-de/ducktape) falls back to the
+standard iRODS environment file (`~/.irods/irods_environment.json` / `.irodsA`).
 
-| Setting     | Environment variable | Default                  |
-| ----------- | -------------------- | ------------------------ |
-| iRODS host  | `IRODS_HOST`         | _(use env file instead)_ |
-| iRODS port  | `IRODS_PORT`         | `1247`                   |
-| iRODS user  | `IRODS_USER`         | _(from env file)_        |
-| iRODS zone  | `IRODS_ZONE`         | _(from env file)_        |
-| iRODS password | `IRODS_PASSWORD`  | _(from `.irodsA`)_       |
+| Setting        | Environment variable | Default                  |
+| -------------- | -------------------- | ------------------------ |
+| iRODS host     | `IRODS_HOST`         | _(use env file instead)_ |
+| iRODS port     | `IRODS_PORT`         | `1247`                   |
+| iRODS user     | `IRODS_USER`         | _(from env file)_        |
+| iRODS zone     | `IRODS_ZONE`         | _(from env file)_        |
+| iRODS password | `IRODS_PASSWORD`     | _(from `.irodsA`)_       |
 
-Like `QUACK_TOKEN`, `IRODS_PASSWORD` is env-only so the secret is not exposed via process
+Like the tokens, `IRODS_PASSWORD` is env-only so the secret isn't exposed via process
 arguments.
 
-## HTTP log ingest (Fluent Bit)
+## The `logs` table
 
-Fluent Bit can't speak the Quack protocol, so scrooge also exposes an HTTP endpoint its
-`http` output can POST to. The endpoint runs **only when `SCROOGE_INGEST_TOKEN` is set**
-(env-only, like the other secrets; at least 4 characters). It serves on its own port
-(default `9595`, separate from Quack's `9494`) in a background thread, writing to the same
-`logs` table on a dedicated DuckDB connection — so it coexists with Quack ingestion and the
-retention sweep (cross-connection concurrency is left to DuckDB's MVCC).
+All ingestion paths land in one table, defined in `schema.sql`:
+
+| Column         | Type        | Notes                        |
+| -------------- | ----------- | ---------------------------- |
+| `capture_time` | `TIMESTAMP` | when the line was captured (UTC) |
+| `service`      | `VARCHAR`   | originating service          |
+| `pod`          | `VARCHAR`   | Kubernetes pod (nullable)    |
+| `node`         | `VARCHAR`   | Kubernetes node (nullable)   |
+| `stream`       | `VARCHAR`   | `stdout`/`stderr`            |
+| `level`        | `VARCHAR`   | log level (defaults to `''`) |
+| `message`      | `VARCHAR`   | the log line                 |
+| `fields`       | `JSON`      | structured fields (nullable) |
+
+`all_logs` is a view over the live table `UNION ALL` the Parquet archive.
+
+## Reading the logs
+
+From a DuckDB 1.5.3+ client over Quack:
+
+```sql
+CREATE SECRET quack_remote (TYPE quack, TOKEN 'super_secret');
+ATTACH 'quack:HOST:9494' AS remote;
+SELECT count(*) FROM remote.logs;
+```
+
+(The `all_logs` view, which also spans the Parquet archive, is queried on the server; remote
+clients see the live `remote.logs` table.)
+
+## Sending logs from Fluent Bit
+
+Set `SCROOGE_INGEST_TOKEN` to enable the endpoint. It exposes:
 
 - `POST <path>` (default `/logs`) — requires `Authorization: Bearer <SCROOGE_INGEST_TOKEN>`.
   The body may be a JSON array (Fluent Bit `format json`) or newline-delimited JSON
   (`format json_lines`). Returns `204` on success, `401` on a bad/absent token, `400` on an
   unparseable body, `500` on a DB error (Fluent Bit retries non-2xx).
-- `GET /healthz` — unauthenticated `200 ok`, for Kubernetes probes.
+- `GET /healthz` — unauthenticated `200 ok`, for Kubernetes liveness probes.
 
 Each record maps onto `logs` as follows; the **entire original record** is preserved in
-`fields` (JSON), so nothing is lost:
+`fields`, so nothing is lost:
 
-| Column | Source in the Fluent Bit record |
-| --- | --- |
+| Column         | Source in the Fluent Bit record |
+| -------------- | ------------------------------- |
 | `capture_time` | the timestamp field (`date`); epoch or ISO-8601, else receive time |
-| `service` | `kubernetes.labels["app.kubernetes.io/name"]`, else `kubernetes.container_name`, else `"unknown"` |
-| `pod` | `kubernetes.pod_name` |
-| `node` | `kubernetes.host` |
-| `stream` | `stream` (`stdout`/`stderr`) |
-| `level` | `level` (default `""`) |
-| `message` | `log` (trailing newline stripped) |
-| `fields` | the whole record |
+| `service`      | `kubernetes.labels["app.kubernetes.io/name"]`, else `kubernetes.container_name`, else `"unknown"` |
+| `pod`          | `kubernetes.pod_name`           |
+| `node`         | `kubernetes.host`               |
+| `stream`       | `stream` (`stdout`/`stderr`)    |
+| `level`        | `level` (default `""`)          |
+| `message`      | `log` (trailing newline stripped) |
+| `fields`       | the whole record                |
 
 The `service` label key is configurable (`SCROOGE_INGEST_SERVICE_LABEL_KEY`); the default
 `app.kubernetes.io/name` requires that workloads set that
 [recommended label](https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/)
-and that the Fluent Bit kubernetes filter runs with `labels On`.
-
-Example Fluent Bit config:
+and that the Fluent Bit kubernetes filter runs with `Labels On`.
 
 ```ini
 [FILTER]
@@ -204,29 +185,45 @@ Example Fluent Bit config:
     Header           Authorization Bearer ${SCROOGE_INGEST_TOKEN}
 ```
 
-## Running
+## Archival design
 
-```bash
-QUACK_TOKEN=super_secret \
-SCROOGE_INGEST_TOKEN=ingest_secret \
-uv run scrooge \
-    --database data/scrooge.duckdb \
-    --schema-sql schema.sql \
-    --storage-dir irods:///zone/home/user/scrooge
-```
+**Sweep loop.** After the servers start, the main thread runs a retention *sweep* every
+`SCROOGE_SWEEP_INTERVAL` seconds until signalled, then runs one final sweep before
+shutdown. A sweep is best-effort: any failure (archive unreachable, a DuckDB error) is
+logged and swallowed so it can never take down the live ingestion endpoints — the next
+interval retries.
 
-Omit `--storage-dir` to run without archival (the live `logs` table grows unbounded), and
-omit `SCROOGE_INGEST_TOKEN` to run without the HTTP ingest endpoint.
+**Rolling.** Each sweep finds every service whose live row count exceeds
+`SCROOGE_RETENTION_ROWS` and exports its **oldest day first** to Parquet, deleting those
+rows, until the service is back under the threshold. The most recent day is kept live where
+possible. Files are written as
+`<storage-dir>/<service>/<YYYY-MM-DD>-<NNN>_<service>.parquet`, where `<NNN>` is a sequence
+that increments when a day is archived across more than one sweep (computed by listing the
+directory, so glob metacharacters in a service name can't reset it).
 
-## Connecting from another DuckDB instance
+**Ordering.** Export is *archive-then-delete*: rows are copied to Parquet first, then
+deleted. This favors never losing rows; if the copy or delete fails, the just-written file
+is removed so the still-live rows aren't re-archived into a second file. The one residual
+risk is a hard kill *between* the copy and delete — duplication in `all_logs`, never loss.
 
-From a DuckDB 1.5.3+ client:
+**Concurrency.** Quack ingestion, HTTP ingestion, and the sweep each run on their own
+DuckDB connection (sharing the same in-process database instance), so no single connection
+is used by two threads; DuckDB's MVCC arbitrates between them.
 
-```sql
-CREATE SECRET quack_remote (TYPE quack, TOKEN 'super_secret');
-ATTACH 'quack:HOST:9494' AS remote;
-SELECT * FROM remote.your_table;
-```
+## iRODS access (`irods://`)
+
+scrooge registers the [ducktape](https://github.com/cyverse-de/ducktape) fsspec backend on
+the DuckDB connection, so SQL can read and write iRODS data objects via `irods://` paths
+(e.g. `read_parquet('irods:///zone/home/user/data.parquet')`). Registration is lazy — no
+iRODS connection is opened until an `irods://` path is actually used — so archival to iRODS
+"just works" once `SCROOGE_STORAGE_DIR` points at one.
+
+## Why Python
+
+Quack is a DuckDB core extension as of v1.5.3 (beta; stable targeted for v2.0.0). The Go
+driver (`duckdb/duckdb-go`) currently bundles libduckdb v1.4.1, which predates Quack, so it
+cannot load the extension. Python's `duckdb` package tracks releases and supports 1.5.3+
+today.
 
 ## Docker
 
@@ -234,10 +231,14 @@ SELECT * FROM remote.your_table;
 docker build -t scrooge .
 docker run --network host \
     -e QUACK_TOKEN=super_secret \
+    -e SCROOGE_INGEST_TOKEN=ingest_secret \
     -e DUCKDB_DATABASE=/data/scrooge.duckdb \
     -v "$PWD/data:/data" \
     scrooge
 ```
+
+The image is a multi-stage build (≈250 MB); `schema.sql` and `startup.sql` ship in it, so
+the defaults work out of the box.
 
 ## Development
 
