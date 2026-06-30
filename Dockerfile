@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 
 WORKDIR /app
 
@@ -17,8 +17,20 @@ RUN uv sync --no-dev --no-install-project --frozen
 COPY . .
 RUN uv sync --no-dev --frozen
 
+# Runtime image: copy only the built venv and app sources from the builder, leaving git,
+# apt metadata, and the uv cache behind. Same base as the builder so the venv's Python
+# matches exactly.
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+
+WORKDIR /app
+
+COPY --from=builder /app /app
+
+# Run the installed console script directly — no uv/git/network needed at runtime.
+ENV PATH="/app/.venv/bin:$PATH"
+
 # Quack's default bind port (override the bind address in startup.sql if needed) and the
 # HTTP log-ingest port (enabled by SCROOGE_INGEST_TOKEN; SCROOGE_INGEST_PORT to change).
 EXPOSE 9494 9595
 
-ENTRYPOINT ["uv", "run", "--no-dev", "scrooge"]
+ENTRYPOINT ["scrooge"]
