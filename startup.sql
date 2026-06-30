@@ -4,4 +4,7 @@
 -- script (the embedded DuckDB library has no getenv function).
 INSTALL quack;
 LOAD quack;
+CALL quack_identify(
+	name => 'scrooge'
+);
 CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname => true, token = getvariable('quack_token'));
