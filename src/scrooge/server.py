@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import duckdb
 import fsspec
@@ -44,10 +45,11 @@ class Config:
 
     `database` is the DuckDB file to open. `boot_sql` runs on every start (it installs
     Quack and calls `quack_serve`). `schema_sql`, when set, runs only when the database
-    is created fresh. `storage_dir`, when set, is the archive root (a URL — `irods://` in
-    production); retention sweeps roll over-threshold services' oldest days into it, and
-    when unset archival is disabled. `retention_rows` is the per-service live-row
-    threshold; `sweep_interval` is the seconds between sweeps.
+    is created fresh; an explicit empty string disables it (`None`). `storage_dir`, when
+    set, is the archive root (a URL — `irods://` in production); retention sweeps roll
+    over-threshold services' oldest days into it, and when unset archival is disabled.
+    `retention_rows` is the per-service live-row threshold; `sweep_interval` is the
+    seconds between sweeps. Both are validated positive.
     """
 
     database: Path
@@ -100,28 +102,58 @@ def resolve_config(
 
     Flags take precedence over the environment. The database path is required; the boot
     script defaults to `startup.sql` and the schema script to `schema.sql` (both in the
-    working directory). The archive `storage_dir` has no default — archival stays off
-    until one is configured.
+    working directory). An explicitly empty schema (flag or env) disables schema setup.
+    The archive `storage_dir` has no default — archival stays off until one is
+    configured — and must be an `irods://` URL or a bare iRODS path.
     """
     db = database or env.get("DUCKDB_DATABASE")
     if not db:
         raise ConfigError(
             "no database path provided; pass --database or set DUCKDB_DATABASE"
         )
-    schema = schema_sql or env.get("DUCKDB_SCHEMA_SQL") or DEFAULT_SCHEMA_SQL
+
+    # Resolve the schema path, distinguishing "unset" (use the default) from an explicit
+    # empty value (disable schema setup): `or` can't tell them apart.
+    if schema_sql is not None:
+        schema_raw = schema_sql
+    elif env.get("DUCKDB_SCHEMA_SQL") is not None:
+        schema_raw = env["DUCKDB_SCHEMA_SQL"]
+    else:
+        schema_raw = DEFAULT_SCHEMA_SQL
+
     boot = boot_sql or env.get("DUCKDB_BOOT_SQL") or DEFAULT_BOOT_SQL
-    storage = storage_dir or env.get("SCROOGE_STORAGE_DIR")
+
+    storage = storage_dir or env.get("SCROOGE_STORAGE_DIR") or None
+    if storage:
+        scheme = urlsplit(storage).scheme
+        if scheme and scheme != "irods":
+            raise ConfigError(
+                "SCROOGE_STORAGE_DIR must be an irods:// URL or a bare iRODS path; "
+                f"got scheme {scheme!r} in {storage!r}"
+            )
+
+    retention_rows_value = _resolve_int(
+        retention_rows, env, "SCROOGE_RETENTION_ROWS", DEFAULT_RETENTION_ROWS
+    )
+    if retention_rows_value <= 0:
+        raise ConfigError(
+            f"SCROOGE_RETENTION_ROWS must be positive; got {retention_rows_value}"
+        )
+    sweep_interval_value = _resolve_float(
+        sweep_interval, env, "SCROOGE_SWEEP_INTERVAL", DEFAULT_SWEEP_INTERVAL
+    )
+    if sweep_interval_value <= 0:
+        raise ConfigError(
+            f"SCROOGE_SWEEP_INTERVAL must be positive; got {sweep_interval_value}"
+        )
+
     return Config(
         database=Path(db),
         boot_sql=Path(boot),
-        schema_sql=Path(schema),
-        storage_dir=storage or None,
-        retention_rows=_resolve_int(
-            retention_rows, env, "SCROOGE_RETENTION_ROWS", DEFAULT_RETENTION_ROWS
-        ),
-        sweep_interval=_resolve_float(
-            sweep_interval, env, "SCROOGE_SWEEP_INTERVAL", DEFAULT_SWEEP_INTERVAL
-        ),
+        schema_sql=Path(schema_raw) if schema_raw else None,
+        storage_dir=storage,
+        retention_rows=retention_rows_value,
+        sweep_interval=sweep_interval_value,
     )
 
 
@@ -153,6 +185,26 @@ def _read_sql(path: Path) -> str:
         raise ConfigError(f"could not read SQL file {path}: {exc}") from exc
 
 
+def _apply_schema(con: duckdb.DuckDBPyConnection, schema_sql: Path) -> None:
+    """Apply schema SQL on a fresh database, tolerating a missing *default* schema file.
+
+    The default `schema.sql` is best-effort: if it isn't present (e.g. not shipped in the
+    image) the server still starts, just without a `logs` table. A schema configured
+    explicitly must exist — a missing one is a hard error so misconfiguration fails fast.
+    """
+    if schema_sql.exists():
+        logger.info("fresh database; applying schema %s", schema_sql)
+        con.execute(_read_sql(schema_sql))
+    elif str(schema_sql) == DEFAULT_SCHEMA_SQL:
+        logger.warning(
+            "fresh database but default schema %s not found; skipping schema setup "
+            "(no `logs` table will be created)",
+            schema_sql,
+        )
+    else:
+        raise ConfigError(f"configured schema SQL not found: {schema_sql}")
+
+
 def _serve(con: duckdb.DuckDBPyConnection, boot_sql: Path) -> None:
     """Run the boot script and log what `quack_serve` reported (listen URI + token).
 
@@ -160,7 +212,15 @@ def _serve(con: duckdb.DuckDBPyConnection, boot_sql: Path) -> None:
     listen URI and auth token (auto-generated when QUACK_TOKEN is unset or too short),
     so we surface it — clients cannot connect without the token.
     """
-    result = con.execute(_read_sql(boot_sql))
+    try:
+        result = con.execute(_read_sql(boot_sql))
+    except duckdb.Error as exc:
+        raise ConfigError(
+            f"boot script {boot_sql} failed: {exc}. This usually means the Quack "
+            "extension could not be installed/loaded, a boot statement "
+            "(e.g. quack_identify/quack_serve) is unsupported by the installed quack "
+            "version, or the listen address is already in use."
+        ) from exc
     if result.description is None:
         logger.warning("boot script produced no result; is quack_serve being called?")
         return
@@ -175,13 +235,30 @@ def _serve(con: duckdb.DuckDBPyConnection, boot_sql: Path) -> None:
 def _sweep(
     con: duckdb.DuckDBPyConnection, fs: AbstractFileSystem, config: Config
 ) -> None:
-    """Run one retention sweep and refresh the `all_logs` view if anything was archived."""
+    """Run one retention sweep and refresh the `all_logs` view if anything was archived.
+
+    Never raises: a sweep is best-effort maintenance and must not take down the live Quack
+    ingestion endpoint, so any failure (archive unreachable, DuckDB error during
+    COPY/DELETE) is logged and swallowed for the next interval to retry.
+    """
     if not config.storage_dir:
         return
-    written = retention.sweep_once(con, fs, config.storage_dir, config.retention_rows)
-    if written:
-        retention.refresh_view(con, fs, config.storage_dir)
-        logger.info("rolled %d parquet file(s) to %s", len(written), config.storage_dir)
+    try:
+        written = retention.sweep_once(
+            con, fs, config.storage_dir, config.retention_rows
+        )
+        if written:
+            retention.refresh_view(con, fs, config.storage_dir)
+            logger.info(
+                "rolled %d parquet file(s) to %s", len(written), config.storage_dir
+            )
+    except Exception as exc:
+        logger.warning(
+            "retention sweep failed; will retry next interval. Probable cause: the "
+            "archive (iRODS) is unreachable or a DuckDB error occurred during "
+            "COPY/DELETE. (%s)",
+            exc,
+        )
 
 
 def _sweep_until_signal(
@@ -190,9 +267,11 @@ def _sweep_until_signal(
     config: Config,
     stop: threading.Event,
 ) -> None:
-    """Sweep on each interval tick until signalled. Runs on the main thread (so the signal
-    handlers install) and is the only Python caller on the connection, so no lock is
-    needed between sweeps and Quack's own appends.
+    """Sweep on each interval tick until signalled.
+
+    Runs on the main thread so the signal handlers install, and is the only Python-side
+    caller on the connection, so no lock is needed among Python threads. Concurrent log
+    appends arrive through Quack's own server rather than this loop.
     """
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
@@ -288,10 +367,12 @@ def run(
         fs = _register_filesystems(con, env)
         if should_run_schema(existed=existed, schema_sql=config.schema_sql):
             assert config.schema_sql is not None
-            logger.info("fresh database; applying schema %s", config.schema_sql)
-            con.execute(_read_sql(config.schema_sql))
+            _apply_schema(con, config.schema_sql)
         _serve(con, config.boot_sql)
-        retention.refresh_view(con, fs, config.storage_dir)
+        try:
+            retention.refresh_view(con, fs, config.storage_dir)
+        except Exception as exc:
+            logger.warning("initial all_logs view refresh failed: %s", exc)
         _sweep_until_signal(con, fs, config, stop)
         _sweep(con, fs, config)
     finally:

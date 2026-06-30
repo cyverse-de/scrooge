@@ -13,11 +13,14 @@ would collapse ``irods://`` to ``irods:/``.
 
 from __future__ import annotations
 
+import logging
 import posixpath
 from datetime import date
 
 import duckdb
 from fsspec.spec import AbstractFileSystem
+
+logger = logging.getLogger("scrooge.retention")
 
 # Column order used by every SELECT against the logs table; mirrors the schema.sql DDL.
 COLUMNS: tuple[str, ...] = (
@@ -51,13 +54,25 @@ def service_dir(storage_dir: str, service: str) -> str:
 def _next_sequence(
     fs: AbstractFileSystem, directory: str, day: str, service_lower: str
 ) -> int:
+    """Next per-day sequence number, found by listing the directory and matching names.
+
+    Listing (not globbing) avoids treating glob metacharacters in a service name
+    (`*`, `?`, `[`) as patterns — which would silently fail to match existing files and
+    reset the sequence to 1, overwriting an already-archived file.
+    """
+    prefix = f"{day}-"
     suffix = f"_{service_lower}.parquet"
     highest = 0
-    for path in fs.glob(f"{directory}/{day}-*{suffix}"):
+    try:
+        entries = fs.ls(directory, detail=False)
+    except FileNotFoundError:
+        return 1
+    for path in entries:
         name = posixpath.basename(str(path))
-        seq_part = name[len(day) + 1 : -len(suffix)]
-        if seq_part.isdigit():
-            highest = max(highest, int(seq_part))
+        if name.startswith(prefix) and name.endswith(suffix):
+            seq_part = name[len(prefix) : -len(suffix)]
+            if seq_part.isdigit():
+                highest = max(highest, int(seq_part))
     return highest + 1
 
 
@@ -68,7 +83,14 @@ def export_day(
     service: str,
     day: date,
 ) -> str:
-    """Export one service's logs for one day to a new Parquet file and return its URL."""
+    """Export one service's logs for one day to a new Parquet file and return its URL.
+
+    The COPY and DELETE are not transactional across the file write, so on any error
+    after the COPY the just-written Parquet is removed — otherwise its rows are still live
+    and the next sweep would archive them again into a new sequence file, double-counting
+    in `all_logs`. A hard kill between the COPY and DELETE can still leave a file (the
+    residual, accepted duplication risk); favouring this order never loses rows.
+    """
     directory = service_dir(storage_dir, service)
     fs.makedirs(directory, exist_ok=True)
     day_str = day.isoformat()
@@ -80,11 +102,23 @@ def export_day(
         f"service = {sql_literal(service)} "
         f"AND capture_time::date = DATE {sql_literal(day_str)}"
     )
-    conn.execute(
-        f"COPY (SELECT {_SELECT_COLS} FROM logs WHERE {predicate} ORDER BY capture_time) "
-        f"TO {sql_literal(out_url)} (FORMAT PARQUET)"
-    )
-    conn.execute(f"DELETE FROM logs WHERE {predicate}")
+    try:
+        conn.execute(
+            f"COPY (SELECT {_SELECT_COLS} FROM logs WHERE {predicate} "
+            f"ORDER BY capture_time) TO {sql_literal(out_url)} (FORMAT PARQUET)"
+        )
+        conn.execute(f"DELETE FROM logs WHERE {predicate}")
+    except Exception:
+        try:
+            if fs.exists(out_url):
+                fs.rm(out_url)
+        except Exception as cleanup_exc:
+            logger.warning(
+                "failed to remove orphan parquet %s after export error: %s",
+                out_url,
+                cleanup_exc,
+            )
+        raise
     return out_url
 
 
@@ -131,6 +165,13 @@ def sweep_once(
     return written
 
 
+def _logs_table_exists(conn: duckdb.DuckDBPyConnection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'logs' LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
 def refresh_view(
     conn: duckdb.DuckDBPyConnection,
     fs: AbstractFileSystem,
@@ -139,7 +180,12 @@ def refresh_view(
     """(Re)create the ``all_logs`` view spanning live rows and the Parquet archive.
 
     With no archive configured or no Parquet present, the view is just the live table.
+    No-op when there is no ``logs`` table (e.g. a pre-existing database, or a custom
+    schema that doesn't define it) — building the view would otherwise raise.
     """
+    if not _logs_table_exists(conn):
+        logger.warning("no `logs` table present; leaving `all_logs` view uncreated")
+        return
     if storage_dir:
         pattern = f"{storage_dir.rstrip('/')}/*/*.parquet"
         if fs.glob(pattern):

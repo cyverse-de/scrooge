@@ -45,7 +45,14 @@ which `startup.sql` reads via `getvariable('quack_token')`.
 
 The schema SQL file runs **only** when the database is created fresh. It defaults to
 `schema.sql` (which defines the `logs` table; see below). Use it for one-time schema and
-seed data — idempotent DDL (`CREATE TABLE IF NOT EXISTS`, ...) is harmless either way.
+seed data — idempotent DDL (`CREATE TABLE IF NOT EXISTS`, ...) is harmless either way. A
+missing **default** `schema.sql` is tolerated (the server starts without a `logs` table);
+an explicitly configured schema that is missing is a hard error. Set the value to an empty
+string to disable schema execution entirely.
+
+`SCROOGE_STORAGE_DIR` must be an `irods://` URL or a bare iRODS path — archives are written
+through the registered iRODS backend (see below). `SCROOGE_RETENTION_ROWS` and
+`SCROOGE_SWEEP_INTERVAL` must be positive.
 
 ## Log aggregation & archival
 

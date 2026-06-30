@@ -3,11 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pytest
 
 from scrooge.server import (
+    DEFAULT_SCHEMA_SQL,
     Config,
     ConfigError,
+    _apply_schema,
     _irods_storage_options,
     _register_filesystems,
     resolve_config,
@@ -146,6 +149,98 @@ def test_resolve_config_requires_database() -> None:
 def test_resolve_config_rejects_bad_numbers(env: dict[str, str], match: str) -> None:
     with pytest.raises(ConfigError, match=match):
         resolve_config(database=None, schema_sql=None, boot_sql=None, env=env)
+
+
+@pytest.mark.parametrize(
+    ("schema_sql", "env", "expected"),
+    [
+        (None, {}, Path("schema.sql")),
+        ("", {}, None),
+        (None, {"DUCKDB_SCHEMA_SQL": ""}, None),
+        ("custom.sql", {}, Path("custom.sql")),
+    ],
+    ids=["unset-default", "flag-empty-disables", "env-empty-disables", "explicit"],
+)
+def test_resolve_config_schema_disable(
+    schema_sql: str | None, env: dict[str, str], expected: Path | None
+) -> None:
+    cfg = resolve_config(
+        database="db.duckdb", schema_sql=schema_sql, boot_sql=None, env=env
+    )
+    assert cfg.schema_sql == expected
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"DUCKDB_DATABASE": "db", "SCROOGE_RETENTION_ROWS": "0"},
+        {"DUCKDB_DATABASE": "db", "SCROOGE_RETENTION_ROWS": "-1"},
+    ],
+    ids=["zero", "negative"],
+)
+def test_resolve_config_rejects_nonpositive_retention(env: dict[str, str]) -> None:
+    with pytest.raises(ConfigError, match="RETENTION_ROWS must be positive"):
+        resolve_config(database=None, schema_sql=None, boot_sql=None, env=env)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"DUCKDB_DATABASE": "db", "SCROOGE_SWEEP_INTERVAL": "0"},
+        {"DUCKDB_DATABASE": "db", "SCROOGE_SWEEP_INTERVAL": "-2.5"},
+    ],
+    ids=["zero", "negative"],
+)
+def test_resolve_config_rejects_nonpositive_interval(env: dict[str, str]) -> None:
+    with pytest.raises(ConfigError, match="SWEEP_INTERVAL must be positive"):
+        resolve_config(database=None, schema_sql=None, boot_sql=None, env=env)
+
+
+@pytest.mark.parametrize(
+    "storage", ["file:///tmp/x", "s3://bucket/x"], ids=["file", "s3"]
+)
+def test_resolve_config_rejects_non_irods_storage(storage: str) -> None:
+    with pytest.raises(ConfigError, match="irods"):
+        resolve_config(
+            database="db", schema_sql=None, boot_sql=None, storage_dir=storage, env={}
+        )
+
+
+@pytest.mark.parametrize(
+    "storage",
+    ["irods:///zone/home/x", "irods://zone/x", "/zone/home/x"],
+    ids=["irods-triple-slash", "irods-double-slash", "bare-path"],
+)
+def test_resolve_config_accepts_irods_storage(storage: str) -> None:
+    cfg = resolve_config(
+        database="db", schema_sql=None, boot_sql=None, storage_dir=storage, env={}
+    )
+    assert cfg.storage_dir == storage
+
+
+def test_apply_schema_runs_existing_file(tmp_path: Path) -> None:
+    schema = tmp_path / "s.sql"
+    schema.write_text("CREATE TABLE t (x INTEGER);")
+    con = duckdb.connect(":memory:")
+    _apply_schema(con, schema)
+    count = con.execute("SELECT count(*) FROM t").fetchone()
+    assert count is not None and count[0] == 0
+
+
+def test_apply_schema_skips_missing_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no schema.sql here
+    con = duckdb.connect(":memory:")
+    _apply_schema(con, Path(DEFAULT_SCHEMA_SQL))  # missing default -> skip, no raise
+    tables = con.execute("SELECT count(*) FROM information_schema.tables").fetchone()
+    assert tables is not None and tables[0] == 0
+
+
+def test_apply_schema_errors_on_missing_explicit(tmp_path: Path) -> None:
+    con = duckdb.connect(":memory:")
+    with pytest.raises(ConfigError, match="not found"):
+        _apply_schema(con, tmp_path / "explicit-missing.sql")
 
 
 def test_resolve_token_returns_valid_token() -> None:
