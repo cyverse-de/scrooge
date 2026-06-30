@@ -17,23 +17,55 @@ from scrooge.server import (
 
 
 @pytest.mark.parametrize(
-    ("database", "schema_sql", "boot_sql", "env", "expected"),
+    (
+        "database",
+        "schema_sql",
+        "boot_sql",
+        "storage_dir",
+        "retention_rows",
+        "sweep_interval",
+        "env",
+        "expected",
+    ),
     [
         (
             "db.duckdb",
             None,
             None,
+            None,
+            None,
+            None,
             {},
-            Config(Path("db.duckdb"), Path("startup.sql"), None),
+            Config(
+                Path("db.duckdb"),
+                Path("startup.sql"),
+                Path("schema.sql"),
+                None,
+                100_000,
+                10.0,
+            ),
         ),
         (
             "db.duckdb",
             "schema.sql",
             "boot.sql",
+            "irods://zone/archive",
+            5,
+            2.5,
             {},
-            Config(Path("db.duckdb"), Path("boot.sql"), Path("schema.sql")),
+            Config(
+                Path("db.duckdb"),
+                Path("boot.sql"),
+                Path("schema.sql"),
+                "irods://zone/archive",
+                5,
+                2.5,
+            ),
         ),
         (
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -41,15 +73,35 @@ from scrooge.server import (
                 "DUCKDB_DATABASE": "env.duckdb",
                 "DUCKDB_SCHEMA_SQL": "env-schema.sql",
                 "DUCKDB_BOOT_SQL": "env-boot.sql",
+                "SCROOGE_STORAGE_DIR": "irods://zone/env-archive",
+                "SCROOGE_RETENTION_ROWS": "42",
+                "SCROOGE_SWEEP_INTERVAL": "1.5",
             },
-            Config(Path("env.duckdb"), Path("env-boot.sql"), Path("env-schema.sql")),
+            Config(
+                Path("env.duckdb"),
+                Path("env-boot.sql"),
+                Path("env-schema.sql"),
+                "irods://zone/env-archive",
+                42,
+                1.5,
+            ),
         ),
         (
             "flag.duckdb",
             None,
             None,
-            {"DUCKDB_DATABASE": "env.duckdb"},
-            Config(Path("flag.duckdb"), Path("startup.sql"), None),
+            None,
+            None,
+            None,
+            {"DUCKDB_DATABASE": "env.duckdb", "SCROOGE_RETENTION_ROWS": "7"},
+            Config(
+                Path("flag.duckdb"),
+                Path("startup.sql"),
+                Path("schema.sql"),
+                None,
+                7,
+                10.0,
+            ),
         ),
     ],
     ids=["defaults", "all-flags", "all-env", "flag-overrides-env"],
@@ -58,12 +110,21 @@ def test_resolve_config(
     database: str | None,
     schema_sql: str | None,
     boot_sql: str | None,
+    storage_dir: str | None,
+    retention_rows: int | None,
+    sweep_interval: float | None,
     env: dict[str, str],
     expected: Config,
 ) -> None:
     assert (
         resolve_config(
-            database=database, schema_sql=schema_sql, boot_sql=boot_sql, env=env
+            database=database,
+            schema_sql=schema_sql,
+            boot_sql=boot_sql,
+            storage_dir=storage_dir,
+            retention_rows=retention_rows,
+            sweep_interval=sweep_interval,
+            env=env,
         )
         == expected
     )
@@ -72,6 +133,19 @@ def test_resolve_config(
 def test_resolve_config_requires_database() -> None:
     with pytest.raises(ConfigError, match="no database path"):
         resolve_config(database=None, schema_sql=None, boot_sql=None, env={})
+
+
+@pytest.mark.parametrize(
+    ("env", "match"),
+    [
+        ({"DUCKDB_DATABASE": "db", "SCROOGE_RETENTION_ROWS": "lots"}, "integer"),
+        ({"DUCKDB_DATABASE": "db", "SCROOGE_SWEEP_INTERVAL": "soon"}, "number"),
+    ],
+    ids=["bad-retention-rows", "bad-sweep-interval"],
+)
+def test_resolve_config_rejects_bad_numbers(env: dict[str, str], match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        resolve_config(database=None, schema_sql=None, boot_sql=None, env=env)
 
 
 def test_resolve_token_returns_valid_token() -> None:

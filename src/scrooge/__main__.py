@@ -28,6 +28,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="SQL run on every start; installs Quack and calls quack_serve "
         "(env: DUCKDB_BOOT_SQL, default: startup.sql)",
     )
+    parser.add_argument(
+        "--storage-dir",
+        help="archive root URL (e.g. irods://...) for rolled-off Parquet logs; "
+        "archival is disabled when unset (env: SCROOGE_STORAGE_DIR)",
+    )
+    parser.add_argument(
+        "--retention-rows",
+        type=int,
+        help="per-service live-row threshold that triggers archival "
+        "(env: SCROOGE_RETENTION_ROWS, default: 100000)",
+    )
+    parser.add_argument(
+        "--sweep-interval",
+        type=float,
+        help="seconds between retention sweeps "
+        "(env: SCROOGE_SWEEP_INTERVAL, default: 10.0)",
+    )
     return parser.parse_args(argv)
 
 
@@ -42,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
             database=args.database,
             schema_sql=args.schema_sql,
             boot_sql=args.boot_sql,
+            storage_dir=args.storage_dir,
+            retention_rows=args.retention_rows,
+            sweep_interval=args.sweep_interval,
             env=os.environ,
         )
         token = resolve_token(os.environ)
