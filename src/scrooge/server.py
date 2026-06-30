@@ -269,9 +269,9 @@ def _sweep_until_signal(
 ) -> None:
     """Sweep on each interval tick until signalled.
 
-    Runs on the main thread so the signal handlers install, and is the only Python-side
-    caller on the connection, so no lock is needed among Python threads. Concurrent log
-    appends arrive through Quack's own server rather than this loop.
+    Runs on the main thread so the signal handlers install. `con` here is a dedicated
+    sweep connection, distinct from the one Quack serves on, so no single connection
+    object is shared across threads; cross-connection concurrency is left to DuckDB's MVCC.
     """
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
@@ -280,10 +280,14 @@ def _sweep_until_signal(
         _sweep(con, fs, config)
 
 
-def _shutdown(con: duckdb.DuckDBPyConnection, fs: AbstractFileSystem | None) -> None:
-    """Checkpoint and close the database, then release the iRODS session pool.
+def _shutdown(
+    con: duckdb.DuckDBPyConnection,
+    sweep_con: duckdb.DuckDBPyConnection | None,
+    fs: AbstractFileSystem | None,
+) -> None:
+    """Checkpoint and close the database connections, then release the iRODS session pool.
 
-    Order matters. Closing the connection releases DuckDB's `read_parquet` file handles,
+    Order matters. Closing the connections releases DuckDB's `read_parquet` file handles,
     but those handles sit in reference cycles, so refcounting alone won't finalize them —
     a `gc.collect()` runs their close while the iRODS session is still alive. Only then do
     we close the session. Skipping this lets the handles finalize at interpreter exit
@@ -294,6 +298,8 @@ def _shutdown(con: duckdb.DuckDBPyConnection, fs: AbstractFileSystem | None) -> 
         con.execute("CHECKPOINT")
     except duckdb.Error as exc:
         logger.warning("checkpoint failed during shutdown: %s", exc)
+    if sweep_con is not None:
+        sweep_con.close()
     con.close()
     gc.collect()
     close = getattr(fs, "close", None)
@@ -362,6 +368,7 @@ def run(
     )
     con = duckdb.connect(str(config.database))
     fs: AbstractFileSystem | None = None
+    sweep_con: duckdb.DuckDBPyConnection | None = None
     try:
         con.execute("SET VARIABLE quack_token = ?", [token])
         fs = _register_filesystems(con, env)
@@ -369,11 +376,17 @@ def run(
             assert config.schema_sql is not None
             _apply_schema(con, config.schema_sql)
         _serve(con, config.boot_sql)
+        # Sweeps run on a separate connection (sharing the same database instance and the
+        # inherited iRODS filesystem) so the main thread never issues queries on `con`
+        # concurrently with Quack's own use of it. DuckDB's MVCC arbitrates the two
+        # connections; a sweep that loses a write-write race with a concurrent append just
+        # raises and is retried next interval (see _sweep).
+        sweep_con = con.cursor()
         try:
-            retention.refresh_view(con, fs, config.storage_dir)
+            retention.refresh_view(sweep_con, fs, config.storage_dir)
         except Exception as exc:
             logger.warning("initial all_logs view refresh failed: %s", exc)
-        _sweep_until_signal(con, fs, config, stop)
-        _sweep(con, fs, config)
+        _sweep_until_signal(sweep_con, fs, config, stop)
+        _sweep(sweep_con, fs, config)
     finally:
-        _shutdown(con, fs)
+        _shutdown(con, sweep_con, fs)
