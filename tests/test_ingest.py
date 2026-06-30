@@ -1,24 +1,29 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
 from scrooge.ingest import (
     BadPayload,
     IngestConfig,
+    IngestError,
     authorized,
     build_app,
     insert_records,
     map_record,
     parse_body,
+    serve_in_thread,
 )
 
 _SCHEMA = (Path(__file__).parent.parent / "schema.sql").read_text()
@@ -230,3 +235,67 @@ def test_healthz_needs_no_auth(
     client, _con = client_and_con
     resp = client.get("/healthz")
     assert resp.status_code == 200 and resp.text == "ok"
+
+
+# --- socket-level tests: exercise the real uvicorn server over a TCP socket ---
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+@pytest.fixture
+def live_server() -> Iterator[tuple[duckdb.DuckDBPyConnection, str]]:
+    con = duckdb.connect(":memory:")
+    con.execute(_SCHEMA)
+    cfg = IngestConfig(token="super_secret", host="127.0.0.1", port=_free_port())
+    server, thread = serve_in_thread(build_app(con, threading.Lock(), cfg), cfg)
+    try:
+        yield con, f"http://127.0.0.1:{cfg.port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+        con.close()
+
+
+def test_live_server_ingests_over_socket(
+    live_server: tuple[duckdb.DuckDBPyConnection, str],
+) -> None:
+    con, base = live_server
+    resp = httpx.post(
+        f"{base}/logs", content=json.dumps([_FULL_RECORD]).encode(), headers=_GOOD_AUTH
+    )
+    assert resp.status_code == 204
+    row = con.execute("SELECT service, message, capture_time FROM logs").fetchone()
+    assert row == ("svc", "hello world", datetime(2025, 1, 1))
+
+    health = httpx.get(f"{base}/healthz")
+    assert health.status_code == 200 and health.text == "ok"
+
+    bad = httpx.post(
+        f"{base}/logs", content=b"[]", headers={"Authorization": "Bearer nope"}
+    )
+    assert bad.status_code == 401
+
+
+@pytest.mark.filterwarnings(
+    # uvicorn calls sys.exit(1) inside its thread on bind failure — that thread death is
+    # exactly what serve_in_thread detects; the resulting warning is expected here.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+def test_serve_in_thread_raises_on_bind_conflict() -> None:
+    port = _free_port()
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", port))
+    blocker.listen()
+    con = duckdb.connect(":memory:")
+    con.execute(_SCHEMA)
+    cfg = IngestConfig(token="super_secret", host="127.0.0.1", port=port)
+    try:
+        with pytest.raises(IngestError):
+            serve_in_thread(build_app(con, threading.Lock(), cfg), cfg)
+    finally:
+        blocker.close()
+        con.close()
