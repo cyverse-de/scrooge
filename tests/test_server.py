@@ -14,9 +14,28 @@ from scrooge.server import (
     _irods_storage_options,
     _register_filesystems,
     resolve_config,
+    resolve_ingest_token,
     resolve_token,
     should_run_schema,
 )
+
+
+def _cfg(**overrides: Any) -> Config:
+    """A Config with all-default fields, overridable per test case."""
+    base: dict[str, Any] = {
+        "database": Path("db.duckdb"),
+        "boot_sql": Path("startup.sql"),
+        "schema_sql": Path("schema.sql"),
+        "storage_dir": None,
+        "retention_rows": 100_000,
+        "sweep_interval": 10.0,
+        "ingest_host": "0.0.0.0",
+        "ingest_port": 9595,
+        "ingest_path": "/logs",
+        "ingest_service_label_key": "app.kubernetes.io/name",
+    }
+    base.update(overrides)
+    return Config(**base)
 
 
 @pytest.mark.parametrize(
@@ -31,23 +50,7 @@ from scrooge.server import (
         "expected",
     ),
     [
-        (
-            "db.duckdb",
-            None,
-            None,
-            None,
-            None,
-            None,
-            {},
-            Config(
-                Path("db.duckdb"),
-                Path("startup.sql"),
-                Path("schema.sql"),
-                None,
-                100_000,
-                10.0,
-            ),
-        ),
+        ("db.duckdb", None, None, None, None, None, {}, _cfg()),
         (
             "db.duckdb",
             "schema.sql",
@@ -56,13 +59,11 @@ from scrooge.server import (
             5,
             2.5,
             {},
-            Config(
-                Path("db.duckdb"),
-                Path("boot.sql"),
-                Path("schema.sql"),
-                "irods://zone/archive",
-                5,
-                2.5,
+            _cfg(
+                boot_sql=Path("boot.sql"),
+                storage_dir="irods://zone/archive",
+                retention_rows=5,
+                sweep_interval=2.5,
             ),
         ),
         (
@@ -79,14 +80,22 @@ from scrooge.server import (
                 "SCROOGE_STORAGE_DIR": "irods://zone/env-archive",
                 "SCROOGE_RETENTION_ROWS": "42",
                 "SCROOGE_SWEEP_INTERVAL": "1.5",
+                "SCROOGE_INGEST_HOST": "127.0.0.1",
+                "SCROOGE_INGEST_PORT": "8080",
+                "SCROOGE_INGEST_PATH": "/ingest",
+                "SCROOGE_INGEST_SERVICE_LABEL_KEY": "app",
             },
-            Config(
-                Path("env.duckdb"),
-                Path("env-boot.sql"),
-                Path("env-schema.sql"),
-                "irods://zone/env-archive",
-                42,
-                1.5,
+            _cfg(
+                database=Path("env.duckdb"),
+                boot_sql=Path("env-boot.sql"),
+                schema_sql=Path("env-schema.sql"),
+                storage_dir="irods://zone/env-archive",
+                retention_rows=42,
+                sweep_interval=1.5,
+                ingest_host="127.0.0.1",
+                ingest_port=8080,
+                ingest_path="/ingest",
+                ingest_service_label_key="app",
             ),
         ),
         (
@@ -97,14 +106,7 @@ from scrooge.server import (
             None,
             None,
             {"DUCKDB_DATABASE": "env.duckdb", "SCROOGE_RETENTION_ROWS": "7"},
-            Config(
-                Path("flag.duckdb"),
-                Path("startup.sql"),
-                Path("schema.sql"),
-                None,
-                7,
-                10.0,
-            ),
+            _cfg(database=Path("flag.duckdb"), retention_rows=7),
         ),
     ],
     ids=["defaults", "all-flags", "all-env", "flag-overrides-env"],
@@ -136,6 +138,37 @@ def test_resolve_config(
 def test_resolve_config_requires_database() -> None:
     with pytest.raises(ConfigError, match="no database path"):
         resolve_config(database=None, schema_sql=None, boot_sql=None, env={})
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"DUCKDB_DATABASE": "db", "SCROOGE_INGEST_PORT": "0"},
+        {"DUCKDB_DATABASE": "db", "SCROOGE_INGEST_PORT": "70000"},
+    ],
+    ids=["zero", "too-high"],
+)
+def test_resolve_config_rejects_bad_ingest_port(env: dict[str, str]) -> None:
+    with pytest.raises(ConfigError, match="INGEST_PORT must be between"):
+        resolve_config(database=None, schema_sql=None, boot_sql=None, env=env)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, None),
+        ({"SCROOGE_INGEST_TOKEN": ""}, None),
+        ({"SCROOGE_INGEST_TOKEN": "super_secret"}, "super_secret"),
+    ],
+    ids=["unset", "empty", "set"],
+)
+def test_resolve_ingest_token(env: dict[str, str], expected: str | None) -> None:
+    assert resolve_ingest_token(env) == expected
+
+
+def test_resolve_ingest_token_rejects_short() -> None:
+    with pytest.raises(ConfigError, match="SCROOGE_INGEST_TOKEN"):
+        resolve_ingest_token({"SCROOGE_INGEST_TOKEN": "abc"})
 
 
 @pytest.mark.parametrize(

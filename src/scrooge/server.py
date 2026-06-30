@@ -22,9 +22,10 @@ from urllib.parse import urlsplit
 
 import duckdb
 import fsspec
+import uvicorn
 from fsspec.spec import AbstractFileSystem
 
-from scrooge import retention
+from scrooge import ingest, retention
 
 logger = logging.getLogger("scrooge")
 
@@ -49,7 +50,9 @@ class Config:
     set, is the archive root (a URL — `irods://` in production); retention sweeps roll
     over-threshold services' oldest days into it, and when unset archival is disabled.
     `retention_rows` is the per-service live-row threshold; `sweep_interval` is the
-    seconds between sweeps. Both are validated positive.
+    seconds between sweeps. Both are validated positive. The `ingest_*` fields configure
+    the HTTP ingest endpoint (non-secret settings only); the endpoint runs only when an
+    ingest token is supplied separately to `run()`.
     """
 
     database: Path
@@ -58,6 +61,10 @@ class Config:
     storage_dir: str | None
     retention_rows: int
     sweep_interval: float
+    ingest_host: str
+    ingest_port: int
+    ingest_path: str
+    ingest_service_label_key: str
 
 
 def _resolve_int(
@@ -96,6 +103,10 @@ def resolve_config(
     storage_dir: str | None = None,
     retention_rows: int | None = None,
     sweep_interval: float | None = None,
+    ingest_host: str | None = None,
+    ingest_port: int | None = None,
+    ingest_path: str | None = None,
+    ingest_service_label_key: str | None = None,
     env: Mapping[str, str],
 ) -> Config:
     """Merge CLI flags with environment fallbacks into a validated Config.
@@ -147,6 +158,14 @@ def resolve_config(
             f"SCROOGE_SWEEP_INTERVAL must be positive; got {sweep_interval_value}"
         )
 
+    ingest_port_value = _resolve_int(
+        ingest_port, env, "SCROOGE_INGEST_PORT", ingest.DEFAULT_INGEST_PORT
+    )
+    if not 1 <= ingest_port_value <= 65535:
+        raise ConfigError(
+            f"SCROOGE_INGEST_PORT must be between 1 and 65535; got {ingest_port_value}"
+        )
+
     return Config(
         database=Path(db),
         boot_sql=Path(boot),
@@ -154,6 +173,16 @@ def resolve_config(
         storage_dir=storage,
         retention_rows=retention_rows_value,
         sweep_interval=sweep_interval_value,
+        ingest_host=ingest_host
+        or env.get("SCROOGE_INGEST_HOST")
+        or ingest.DEFAULT_INGEST_HOST,
+        ingest_port=ingest_port_value,
+        ingest_path=ingest_path
+        or env.get("SCROOGE_INGEST_PATH")
+        or ingest.DEFAULT_INGEST_PATH,
+        ingest_service_label_key=ingest_service_label_key
+        or env.get("SCROOGE_INGEST_SERVICE_LABEL_KEY")
+        or ingest.DEFAULT_SERVICE_LABEL_KEY,
     )
 
 
@@ -169,6 +198,23 @@ def resolve_token(env: Mapping[str, str]) -> str:
     if len(token) < MIN_TOKEN_LENGTH:
         raise ConfigError(
             f"QUACK_TOKEN must be set and at least {MIN_TOKEN_LENGTH} characters long"
+        )
+    return token
+
+
+def resolve_ingest_token(env: Mapping[str, str]) -> str | None:
+    """Read the HTTP ingest token from the environment; `None` disables the endpoint.
+
+    Env-only, like `resolve_token`, so the secret never lands in a logged dataclass. When
+    set it must be at least `MIN_TOKEN_LENGTH` characters — a too-short value is a
+    misconfiguration we fail fast on rather than expose a weakly-guarded endpoint.
+    """
+    token = env.get("SCROOGE_INGEST_TOKEN")
+    if not token:
+        return None
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise ConfigError(
+            f"SCROOGE_INGEST_TOKEN must be at least {MIN_TOKEN_LENGTH} characters long"
         )
     return token
 
@@ -283,6 +329,7 @@ def _sweep_until_signal(
 def _shutdown(
     con: duckdb.DuckDBPyConnection,
     sweep_con: duckdb.DuckDBPyConnection | None,
+    ingest_con: duckdb.DuckDBPyConnection | None,
     fs: AbstractFileSystem | None,
 ) -> None:
     """Checkpoint and close the database connections, then release the iRODS session pool.
@@ -300,6 +347,8 @@ def _shutdown(
         logger.warning("checkpoint failed during shutdown: %s", exc)
     if sweep_con is not None:
         sweep_con.close()
+    if ingest_con is not None:
+        ingest_con.close()
     con.close()
     gc.collect()
     close = getattr(fs, "close", None)
@@ -347,16 +396,40 @@ def _register_filesystems(
     return fs
 
 
+def _start_ingest(
+    con: duckdb.DuckDBPyConnection, config: Config, token: str
+) -> tuple[duckdb.DuckDBPyConnection, uvicorn.Server, threading.Thread]:
+    """Build the ingest app on a dedicated connection and start it in a thread."""
+    cfg = ingest.IngestConfig(
+        token=token,
+        host=config.ingest_host,
+        port=config.ingest_port,
+        path=config.ingest_path,
+        service_label_key=config.ingest_service_label_key,
+    )
+    ingest_con = con.cursor()
+    app = ingest.build_app(ingest_con, threading.Lock(), cfg)
+    try:
+        server, thread = ingest.serve_in_thread(app, cfg)
+    except ingest.IngestError as exc:
+        ingest_con.close()
+        raise ConfigError(str(exc)) from exc
+    return ingest_con, server, thread
+
+
 def run(
     config: Config,
     *,
     token: str,
+    ingest_token: str | None = None,
     env: Mapping[str, str] | None = None,
     stop: threading.Event | None = None,
 ) -> None:
     """Open the database, run setup, start the Quack server, and block until signalled.
 
-    Must run on the main thread so the signal handlers can be installed.
+    Must run on the main thread so the signal handlers can be installed. When
+    `ingest_token` is set, an HTTP ingest endpoint runs in a background thread alongside
+    the Quack server and the sweep loop.
     """
     env = env if env is not None else os.environ
     stop = stop or threading.Event()
@@ -369,6 +442,9 @@ def run(
     con = duckdb.connect(str(config.database))
     fs: AbstractFileSystem | None = None
     sweep_con: duckdb.DuckDBPyConnection | None = None
+    ingest_con: duckdb.DuckDBPyConnection | None = None
+    ingest_server: uvicorn.Server | None = None
+    ingest_thread: threading.Thread | None = None
     try:
         con.execute("SET VARIABLE quack_token = ?", [token])
         fs = _register_filesystems(con, env)
@@ -376,12 +452,18 @@ def run(
             assert config.schema_sql is not None
             _apply_schema(con, config.schema_sql)
         _serve(con, config.boot_sql)
-        # Sweeps run on a separate connection (sharing the same database instance and the
-        # inherited iRODS filesystem) so the main thread never issues queries on `con`
-        # concurrently with Quack's own use of it. DuckDB's MVCC arbitrates the two
-        # connections; a sweep that loses a write-write race with a concurrent append just
-        # raises and is retried next interval (see _sweep).
+        # Sweeps and HTTP ingest each run on their own connection (sharing the same
+        # database instance and the inherited iRODS filesystem) so the main thread and the
+        # ingest thread never issue queries on `con` concurrently with Quack's own use of
+        # it. DuckDB's MVCC arbitrates the connections; a sweep that loses a write-write
+        # race with a concurrent append/insert just raises and is retried (see _sweep).
         sweep_con = con.cursor()
+        if ingest_token:
+            ingest_con, ingest_server, ingest_thread = _start_ingest(
+                con, config, ingest_token
+            )
+        else:
+            logger.info("HTTP ingest disabled (set SCROOGE_INGEST_TOKEN to enable)")
         try:
             retention.refresh_view(sweep_con, fs, config.storage_dir)
         except Exception as exc:
@@ -389,4 +471,15 @@ def run(
         _sweep_until_signal(sweep_con, fs, config, stop)
         _sweep(sweep_con, fs, config)
     finally:
-        _shutdown(con, sweep_con, fs)
+        if ingest_server is not None:
+            ingest_server.should_exit = True
+            if ingest_thread is not None:
+                ingest_thread.join(timeout=10.0)
+                if ingest_thread.is_alive():
+                    # An in-flight insert is still using ingest_con; closing it now could
+                    # crash that worker. Leave it for process exit rather than race it.
+                    logger.warning(
+                        "ingest server did not stop in time; leaving its connection open"
+                    )
+                    ingest_con = None
+        _shutdown(con, sweep_con, ingest_con, fs)

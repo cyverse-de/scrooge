@@ -35,6 +35,11 @@ supports 1.5.3+ today.
 | Archive root    | `--storage-dir`    | `SCROOGE_STORAGE_DIR`    | _(none)_      |
 | Retention rows  | `--retention-rows` | `SCROOGE_RETENTION_ROWS` | `100000`      |
 | Sweep interval  | `--sweep-interval` | `SCROOGE_SWEEP_INTERVAL` | `10.0`        |
+| Ingest token    | _(none)_           | `SCROOGE_INGEST_TOKEN`   | _(unset → off)_ |
+| Ingest host     | `--ingest-host`    | `SCROOGE_INGEST_HOST`    | `0.0.0.0`     |
+| Ingest port     | `--ingest-port`    | `SCROOGE_INGEST_PORT`    | `9595`        |
+| Ingest path     | `--ingest-path`    | `SCROOGE_INGEST_PATH`    | `/logs`       |
+| Ingest service label | `--ingest-service-label-key` | `SCROOGE_INGEST_SERVICE_LABEL_KEY` | `app.kubernetes.io/name` |
 
 Flags take precedence over environment variables. `QUACK_TOKEN` is intentionally
 env-only — secrets passed as CLI flags are visible to anyone who can run `ps`. It is
@@ -147,16 +152,71 @@ explicitly; otherwise ducktape falls back to the standard iRODS environment file
 Like `QUACK_TOKEN`, `IRODS_PASSWORD` is env-only so the secret is not exposed via process
 arguments.
 
+## HTTP log ingest (Fluent Bit)
+
+Fluent Bit can't speak the Quack protocol, so scrooge also exposes an HTTP endpoint its
+`http` output can POST to. The endpoint runs **only when `SCROOGE_INGEST_TOKEN` is set**
+(env-only, like the other secrets; at least 4 characters). It serves on its own port
+(default `9595`, separate from Quack's `9494`) in a background thread, writing to the same
+`logs` table on a dedicated DuckDB connection — so it coexists with Quack ingestion and the
+retention sweep (cross-connection concurrency is left to DuckDB's MVCC).
+
+- `POST <path>` (default `/logs`) — requires `Authorization: Bearer <SCROOGE_INGEST_TOKEN>`.
+  The body may be a JSON array (Fluent Bit `format json`) or newline-delimited JSON
+  (`format json_lines`). Returns `204` on success, `401` on a bad/absent token, `400` on an
+  unparseable body, `500` on a DB error (Fluent Bit retries non-2xx).
+- `GET /healthz` — unauthenticated `200 ok`, for Kubernetes probes.
+
+Each record maps onto `logs` as follows; the **entire original record** is preserved in
+`fields` (JSON), so nothing is lost:
+
+| Column | Source in the Fluent Bit record |
+| --- | --- |
+| `capture_time` | the timestamp field (`date`); epoch or ISO-8601, else receive time |
+| `service` | `kubernetes.labels["app.kubernetes.io/name"]`, else `kubernetes.container_name`, else `"unknown"` |
+| `pod` | `kubernetes.pod_name` |
+| `node` | `kubernetes.host` |
+| `stream` | `stream` (`stdout`/`stderr`) |
+| `level` | `level` (default `""`) |
+| `message` | `log` (trailing newline stripped) |
+| `fields` | the whole record |
+
+The `service` label key is configurable (`SCROOGE_INGEST_SERVICE_LABEL_KEY`); the default
+`app.kubernetes.io/name` requires that workloads set that
+[recommended label](https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/)
+and that the Fluent Bit kubernetes filter runs with `labels On`.
+
+Example Fluent Bit config:
+
+```ini
+[FILTER]
+    Name             kubernetes
+    Match            kube.*
+    Labels           On
+
+[OUTPUT]
+    Name             http
+    Match            kube.*
+    Host             scrooge
+    Port             9595
+    URI              /logs
+    Format           json
+    Header           Authorization Bearer ${SCROOGE_INGEST_TOKEN}
+```
+
 ## Running
 
 ```bash
-QUACK_TOKEN=super_secret uv run scrooge \
+QUACK_TOKEN=super_secret \
+SCROOGE_INGEST_TOKEN=ingest_secret \
+uv run scrooge \
     --database data/scrooge.duckdb \
     --schema-sql schema.sql \
     --storage-dir irods:///zone/home/user/scrooge
 ```
 
-Omit `--storage-dir` to run without archival (the live `logs` table grows unbounded).
+Omit `--storage-dir` to run without archival (the live `logs` table grows unbounded), and
+omit `SCROOGE_INGEST_TOKEN` to run without the HTTP ingest endpoint.
 
 ## Connecting from another DuckDB instance
 
