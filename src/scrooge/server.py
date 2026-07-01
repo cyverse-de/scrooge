@@ -464,6 +464,17 @@ def run(
             )
         else:
             logger.info("HTTP ingest disabled (set SCROOGE_INGEST_TOKEN to enable)")
+        # Reconcile interrupted exports before the view is built so an orphaned parquet
+        # never enters `all_logs`, even transiently; sweep_once re-checks as a backstop.
+        if config.storage_dir:
+            try:
+                retention.reconcile_pending(sweep_con, fs)
+            except Exception as exc:
+                logger.warning(
+                    "startup export reconcile failed; sweeps stay paused until it "
+                    "succeeds. Probable cause: the archive (iRODS) is unreachable. (%s)",
+                    exc,
+                )
         try:
             retention.refresh_view(sweep_con, fs, config.storage_dir)
         except Exception as exc:

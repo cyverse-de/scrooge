@@ -36,6 +36,31 @@ COLUMNS: tuple[str, ...] = (
 
 _SELECT_COLS = ", ".join(COLUMNS)
 
+# Journal of exports whose COPY may have happened but whose DELETE has not committed.
+# A surviving row after a crash names a Parquet file that duplicates still-live rows.
+_PENDING_DDL = (
+    "CREATE TABLE IF NOT EXISTS pending_exports ("
+    "out_url VARCHAR NOT NULL PRIMARY KEY, "
+    "service VARCHAR NOT NULL, "
+    "day DATE NOT NULL)"
+)
+
+
+def _ensure_pending_table(conn: duckdb.DuckDBPyConnection) -> None:
+    conn.execute(_PENDING_DDL)
+
+
+def _pending_count(conn: duckdb.DuckDBPyConnection) -> int:
+    row = conn.execute("SELECT count(*) FROM pending_exports").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _rollback_quietly(conn: duckdb.DuckDBPyConnection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except Exception:
+        pass  # no transaction was open
+
 
 def sql_literal(value: str) -> str:
     """Quote a string as a SQL literal, for the few spots a bind parameter won't work.
@@ -85,11 +110,11 @@ def export_day(
 ) -> str:
     """Export one service's logs for one day to a new Parquet file and return its URL.
 
-    The COPY and DELETE are not transactional across the file write, so on any error
-    after the COPY the just-written Parquet is removed — otherwise its rows are still live
-    and the next sweep would archive them again into a new sequence file, double-counting
-    in `all_logs`. A hard kill between the COPY and DELETE can still leave a file (the
-    residual, accepted duplication risk); favouring this order never loses rows.
+    The Parquet write can't join a DuckDB transaction, so a journal closes the gap: an
+    intent marker is committed to `pending_exports` before the COPY, and the row DELETE
+    plus marker removal then commit atomically. On any error the just-written file is
+    removed — its rows are still live, so it would double-count in `all_logs` — and a
+    hard kill leaves the marker for `reconcile_pending` to clean up. Rows are never lost.
     """
     directory = service_dir(storage_dir, service)
     fs.makedirs(directory, exist_ok=True)
@@ -98,28 +123,92 @@ def export_day(
     seq = _next_sequence(fs, directory, day_str, service_lower)
     out_url = f"{directory}/{day_str}-{seq:03d}_{service_lower}.parquet"
 
+    # COPY's inner predicate must be a literal (COPY is not parameterizable); it must
+    # select exactly the rows the parameterized DELETE below removes.
     predicate = (
         f"service = {sql_literal(service)} "
         f"AND capture_time::date = DATE {sql_literal(day_str)}"
+    )
+    _ensure_pending_table(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_exports (out_url, service, day) "
+        "VALUES (?, ?, ?)",
+        [out_url, service, day],
     )
     try:
         conn.execute(
             f"COPY (SELECT {_SELECT_COLS} FROM logs WHERE {predicate} "
             f"ORDER BY capture_time) TO {sql_literal(out_url)} (FORMAT PARQUET)"
         )
-        conn.execute(f"DELETE FROM logs WHERE {predicate}")
+        conn.execute("BEGIN")
+        conn.execute(
+            "DELETE FROM logs WHERE service = ? AND capture_time::date = ?",
+            [service, day],
+        )
+        conn.execute("DELETE FROM pending_exports WHERE out_url = ?", [out_url])
+        conn.execute("COMMIT")
     except Exception:
+        _rollback_quietly(conn)
+        removed = True
         try:
             if fs.exists(out_url):
                 fs.rm(out_url)
         except Exception as cleanup_exc:
+            removed = False
             logger.warning(
                 "failed to remove orphan parquet %s after export error: %s",
                 out_url,
                 cleanup_exc,
             )
+        # The marker must outlive any file that might still exist, so reconcile_pending
+        # can retry the removal; clear it only once the orphan is confirmed gone.
+        if removed:
+            try:
+                conn.execute("DELETE FROM pending_exports WHERE out_url = ?", [out_url])
+            except Exception as marker_exc:
+                logger.warning(
+                    "could not clear pending_exports marker for %s after export "
+                    "failure; startup or the next sweep will reconcile it. (%s)",
+                    out_url,
+                    marker_exc,
+                )
         raise
     return out_url
+
+
+def reconcile_pending(
+    conn: duckdb.DuckDBPyConnection, fs: AbstractFileSystem
+) -> list[str]:
+    """Clean up after interrupted exports; returns the markers cleared.
+
+    A surviving `pending_exports` row means an export's COPY may have run but its DELETE
+    never committed: the rows are still live, so any file at `out_url` is an orphan whose
+    rows would appear twice in `all_logs`. Remove the file, then clear the marker — in
+    that order, so a failed removal keeps the marker and the next reconcile retries.
+    """
+    _ensure_pending_table(conn)
+    cleared: list[str] = []
+    for (out_url,) in conn.execute("SELECT out_url FROM pending_exports").fetchall():
+        try:
+            if fs.exists(out_url):
+                logger.warning(
+                    "removing orphaned parquet %s left by an interrupted export "
+                    "(probable cause: process killed between COPY and DELETE); "
+                    "its rows are still live and will be re-archived",
+                    out_url,
+                )
+                fs.rm(out_url)
+            conn.execute("DELETE FROM pending_exports WHERE out_url = ?", [out_url])
+            cleared.append(out_url)
+        except Exception as exc:
+            logger.warning(
+                "could not reconcile pending export %s; keeping its marker (sweeps "
+                "pause until it clears). Probable cause: the archive (iRODS) is "
+                "unreachable. (%s)",
+                out_url,
+                exc,
+            )
+    return cleared
 
 
 def _service_count(conn: duckdb.DuckDBPyConnection, service: str) -> int:
@@ -145,8 +234,21 @@ def sweep_once(
 ) -> list[str]:
     """Export and delete oldest log-days for every over-threshold service.
 
-    Returns the URLs of the Parquet files written.
+    Returns the URLs of the Parquet files written. Interrupted exports are reconciled
+    first; if a marker can't be cleared (archive unreachable), the sweep is skipped —
+    a COPY would fail the same way, and exporting past an unresolved marker could
+    stack a second sequence file on top of an orphan.
     """
+    _ensure_pending_table(conn)
+    if _pending_count(conn):
+        reconcile_pending(conn, fs)
+        if _pending_count(conn):
+            logger.warning(
+                "skipping retention sweep: unresolved pending-export markers remain "
+                "after reconcile; will retry next interval"
+            )
+            return []
+
     services = [
         r[0]
         for r in conn.execute(
