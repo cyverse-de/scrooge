@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ import fsspec
 import uvicorn
 from fsspec.spec import AbstractFileSystem
 
-from scrooge import ingest, retention
+from scrooge import ingest, metrics, retention
 
 logger = logging.getLogger("scrooge")
 
@@ -51,8 +52,9 @@ class Config:
     over-threshold services' oldest days into it, and when unset archival is disabled.
     `retention_rows` is the per-service live-row threshold; `sweep_interval` is the
     seconds between sweeps. Both are validated positive. The `ingest_*` fields configure
-    the HTTP ingest endpoint (non-secret settings only); the endpoint runs only when an
-    ingest token is supplied separately to `run()`.
+    the HTTP server (non-secret settings only); its probe and metrics routes are always
+    served, while the ingest route itself runs only when an ingest token is supplied
+    separately to `run()`.
     """
 
     database: Path
@@ -65,6 +67,7 @@ class Config:
     ingest_port: int
     ingest_path: str
     ingest_service_label_key: str
+    ingest_access_log: bool
 
 
 def _resolve_int(
@@ -93,6 +96,29 @@ def _resolve_float(
         return float(raw)
     except ValueError as exc:
         raise ConfigError(f"{env_name} must be a number: {raw!r}") from exc
+
+
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def _resolve_bool(env: Mapping[str, str], env_name: str, default: bool) -> bool:
+    """Resolve a boolean env var: unset means the default; anything else must be explicit.
+
+    An unrecognized value — including an explicitly empty one — is a misconfiguration to
+    fail fast on, not something to silently coerce.
+    """
+    raw = env.get(env_name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ConfigError(
+        f"{env_name} must be a boolean (true/false/1/0/yes/no/on/off): {raw!r}"
+    )
 
 
 def resolve_config(
@@ -183,6 +209,9 @@ def resolve_config(
         ingest_service_label_key=ingest_service_label_key
         or env.get("SCROOGE_INGEST_SERVICE_LABEL_KEY")
         or ingest.DEFAULT_SERVICE_LABEL_KEY,
+        # Env-only, default off: in-cluster access logs get scraped by Fluent Bit and
+        # posted back to scrooge, so enabling this risks a log feedback loop.
+        ingest_access_log=_resolve_bool(env, "SCROOGE_INGEST_ACCESS_LOG", False),
     )
 
 
@@ -290,6 +319,7 @@ def _sweep(
     if not config.storage_dir:
         return
     try:
+        start = time.monotonic()
         written = retention.sweep_once(
             con, fs, config.storage_dir, config.retention_rows
         )
@@ -298,7 +328,9 @@ def _sweep(
             logger.info(
                 "rolled %d parquet file(s) to %s", len(written), config.storage_dir
             )
+        metrics.SWEEP_DURATION.observe(time.monotonic() - start)
     except Exception as exc:
+        metrics.SWEEP_FAILURES.inc()
         logger.warning(
             "retention sweep failed; will retry next interval. Probable cause: the "
             "archive (iRODS) is unreachable or a DuckDB error occurred during "
@@ -307,13 +339,30 @@ def _sweep(
         )
 
 
+def _update_live_rows(con: duckdb.DuckDBPyConnection) -> None:
+    """Refresh the per-service live-row gauge; a no-`logs`-table database is a no-op.
+
+    `clear()` before re-setting drops label children for services whose rows have all
+    been archived away, so the gauge doesn't report stale services forever.
+    """
+    try:
+        rows = con.execute(
+            "SELECT service, count(*) FROM logs GROUP BY service"
+        ).fetchall()
+    except duckdb.Error:
+        return
+    metrics.LIVE_ROWS.clear()
+    for service, count in rows:
+        metrics.LIVE_ROWS.labels(service).set(count)
+
+
 def _sweep_until_signal(
     con: duckdb.DuckDBPyConnection,
     fs: AbstractFileSystem,
     config: Config,
     stop: threading.Event,
 ) -> None:
-    """Sweep on each interval tick until signalled.
+    """Update gauges and sweep on each interval tick until signalled.
 
     Runs on the main thread so the signal handlers install. `con` here is a dedicated
     sweep connection, distinct from the one Quack serves on, so no single connection
@@ -323,6 +372,7 @@ def _sweep_until_signal(
         signal.signal(sig, lambda *_: stop.set())
     logger.info("ready; waiting for shutdown signal (SIGINT/SIGTERM)")
     while not stop.wait(config.sweep_interval):
+        _update_live_rows(con)
         _sweep(con, fs, config)
 
 
@@ -396,16 +446,21 @@ def _register_filesystems(
     return fs
 
 
-def _start_ingest(
-    con: duckdb.DuckDBPyConnection, config: Config, token: str
+def _start_http(
+    con: duckdb.DuckDBPyConnection, config: Config, token: str | None
 ) -> tuple[duckdb.DuckDBPyConnection, uvicorn.Server, threading.Thread]:
-    """Build the ingest app on a dedicated connection and start it in a thread."""
+    """Build the HTTP app on a dedicated connection and start it in a thread.
+
+    Always runs: probes and /metrics must be observable even in a Quack-only deployment.
+    The ingest route itself is registered only when `token` is set.
+    """
     cfg = ingest.IngestConfig(
         token=token,
         host=config.ingest_host,
         port=config.ingest_port,
         path=config.ingest_path,
         service_label_key=config.ingest_service_label_key,
+        access_log=config.ingest_access_log,
     )
     ingest_con = con.cursor()
     app = ingest.build_app(ingest_con, threading.Lock(), cfg)
@@ -427,9 +482,9 @@ def run(
 ) -> None:
     """Open the database, run setup, start the Quack server, and block until signalled.
 
-    Must run on the main thread so the signal handlers can be installed. When
-    `ingest_token` is set, an HTTP ingest endpoint runs in a background thread alongside
-    the Quack server and the sweep loop.
+    Must run on the main thread so the signal handlers can be installed. An HTTP server
+    (probes, /metrics, and — when `ingest_token` is set — log ingest) runs in a
+    background thread alongside the Quack server and the sweep loop.
     """
     env = env if env is not None else os.environ
     stop = stop or threading.Event()
@@ -458,12 +513,14 @@ def run(
         # it. DuckDB's MVCC arbitrates the connections; a sweep that loses a write-write
         # race with a concurrent append/insert just raises and is retried (see _sweep).
         sweep_con = con.cursor()
-        if ingest_token:
-            ingest_con, ingest_server, ingest_thread = _start_ingest(
-                con, config, ingest_token
+        ingest_con, ingest_server, ingest_thread = _start_http(
+            con, config, ingest_token
+        )
+        if not ingest_token:
+            logger.info(
+                "HTTP ingest disabled (set SCROOGE_INGEST_TOKEN to enable); "
+                "probes and /metrics still served"
             )
-        else:
-            logger.info("HTTP ingest disabled (set SCROOGE_INGEST_TOKEN to enable)")
         # Reconcile interrupted exports before the view is built so an orphaned parquet
         # never enters `all_logs`, even transiently; sweep_once re-checks as a backstop.
         if config.storage_dir:

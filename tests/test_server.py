@@ -13,6 +13,7 @@ from scrooge.server import (
     _apply_schema,
     _irods_storage_options,
     _register_filesystems,
+    _resolve_bool,
     resolve_config,
     resolve_ingest_token,
     resolve_token,
@@ -33,6 +34,7 @@ def _cfg(**overrides: Any) -> Config:
         "ingest_port": 9595,
         "ingest_path": "/logs",
         "ingest_service_label_key": "app.kubernetes.io/name",
+        "ingest_access_log": False,
     }
     base.update(overrides)
     return Config(**base)
@@ -84,6 +86,7 @@ def _cfg(**overrides: Any) -> Config:
                 "SCROOGE_INGEST_PORT": "8080",
                 "SCROOGE_INGEST_PATH": "/ingest",
                 "SCROOGE_INGEST_SERVICE_LABEL_KEY": "app",
+                "SCROOGE_INGEST_ACCESS_LOG": "true",
             },
             _cfg(
                 database=Path("env.duckdb"),
@@ -96,6 +99,7 @@ def _cfg(**overrides: Any) -> Config:
                 ingest_port=8080,
                 ingest_path="/ingest",
                 ingest_service_label_key="app",
+                ingest_access_log=True,
             ),
         ),
         (
@@ -227,6 +231,48 @@ def test_resolve_config_rejects_nonpositive_retention(env: dict[str, str]) -> No
 def test_resolve_config_rejects_nonpositive_interval(env: dict[str, str]) -> None:
     with pytest.raises(ConfigError, match="SWEEP_INTERVAL must be positive"):
         resolve_config(database=None, schema_sql=None, boot_sql=None, env=env)
+
+
+@pytest.mark.parametrize(
+    ("env", "default", "expected"),
+    [
+        ({}, False, False),
+        ({}, True, True),
+        ({"FLAG": "true"}, False, True),
+        ({"FLAG": "1"}, False, True),
+        ({"FLAG": "YES"}, False, True),
+        ({"FLAG": "on"}, False, True),
+        ({"FLAG": "false"}, True, False),
+        ({"FLAG": "0"}, True, False),
+        ({"FLAG": "No"}, True, False),
+        ({"FLAG": "off"}, True, False),
+    ],
+    ids=[
+        "unset-default-false",
+        "unset-default-true",
+        "true",
+        "one",
+        "yes-upper",
+        "on",
+        "false",
+        "zero",
+        "no-mixed",
+        "off",
+    ],
+)
+def test_resolve_bool(env: dict[str, str], default: bool, expected: bool) -> None:
+    assert _resolve_bool(env, "FLAG", default) is expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "maybe", "2"],
+    ids=["explicit-empty", "garbage", "numeric"],
+)
+def test_resolve_bool_rejects_invalid(raw: str) -> None:
+    # Explicitly empty is not "unset": it must fail fast, not silently become the default.
+    with pytest.raises(ConfigError, match="FLAG must be a boolean"):
+        _resolve_bool({"FLAG": raw}, "FLAG", False)
 
 
 @pytest.mark.parametrize(

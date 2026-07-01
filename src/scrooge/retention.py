@@ -20,6 +20,8 @@ from datetime import date
 import duckdb
 from fsspec.spec import AbstractFileSystem
 
+from scrooge import metrics
+
 logger = logging.getLogger("scrooge.retention")
 
 # Column order used by every SELECT against the logs table; mirrors the schema.sql DDL.
@@ -173,6 +175,14 @@ def export_day(
                     marker_exc,
                 )
         raise
+    metrics.ARCHIVE_FILES.labels(service).inc()
+    try:
+        size = fs.size(out_url)
+    except Exception as exc:
+        logger.debug("could not size archived parquet %s: %s", out_url, exc)
+    else:
+        if size:
+            metrics.ARCHIVE_BYTES.labels(service).inc(size)
     return out_url
 
 

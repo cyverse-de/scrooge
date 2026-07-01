@@ -12,6 +12,7 @@ from typing import Any
 import duckdb
 import httpx
 import pytest
+from prometheus_client import REGISTRY
 from starlette.testclient import TestClient
 
 from scrooge.ingest import (
@@ -204,15 +205,28 @@ _NDJSON_BODY = (
 ).encode()
 
 
+def _outcome_count(outcome: str) -> float:
+    value = REGISTRY.get_sample_value(
+        "scrooge_ingest_requests_total", {"outcome": outcome}
+    )
+    return value or 0.0
+
+
 @pytest.mark.parametrize(
-    ("headers", "body", "status", "count"),
+    ("headers", "body", "status", "count", "outcome"),
     [
-        ({}, b'[{"log":"x","stream":"stdout"}]', 401, 0),
-        ({"Authorization": "Bearer wrong"}, b'[{"log":"x","stream":"stdout"}]', 401, 0),
-        (_GOOD_AUTH, _ARRAY_BODY, 204, 2),
-        (_GOOD_AUTH, _NDJSON_BODY, 204, 2),
-        (_GOOD_AUTH, b"{not json", 400, 0),
-        (_GOOD_AUTH, b"", 204, 0),
+        ({}, b'[{"log":"x","stream":"stdout"}]', 401, 0, "unauthorized"),
+        (
+            {"Authorization": "Bearer wrong"},
+            b'[{"log":"x","stream":"stdout"}]',
+            401,
+            0,
+            "unauthorized",
+        ),
+        (_GOOD_AUTH, _ARRAY_BODY, 204, 2, "ok"),
+        (_GOOD_AUTH, _NDJSON_BODY, 204, 2, "ok"),
+        (_GOOD_AUTH, b"{not json", 400, 0, "bad_payload"),
+        (_GOOD_AUTH, b"", 204, 0, "empty"),
     ],
     ids=["no-auth", "bad-token", "json-array", "ndjson", "bad-body", "empty-body"],
 )
@@ -222,11 +236,33 @@ def test_endpoint_post(
     body: bytes,
     status: int,
     count: int,
+    outcome: str,
 ) -> None:
     client, con = client_and_con
+    # Metrics live in the process-wide default registry, so assert on deltas.
+    before = _outcome_count(outcome)
     resp = client.post("/logs", content=body, headers=headers)
     assert resp.status_code == status
     assert _count(con) == count
+    assert _outcome_count(outcome) == before + 1
+
+
+def test_ingest_rows_counter_by_service(
+    client_and_con: tuple[TestClient, duckdb.DuckDBPyConnection],
+) -> None:
+    def rows(service: str) -> float:
+        return (
+            REGISTRY.get_sample_value("scrooge_ingest_rows_total", {"service": service})
+            or 0.0
+        )
+
+    client, _con = client_and_con
+    before_svc, before_unknown = rows("svc"), rows("unknown")
+    resp = client.post("/logs", content=_ARRAY_BODY, headers=_GOOD_AUTH)
+    assert resp.status_code == 204
+    # _ARRAY_BODY carries one "svc" record and one without kubernetes metadata.
+    assert rows("svc") == before_svc + 1
+    assert rows("unknown") == before_unknown + 1
 
 
 def test_healthz_needs_no_auth(
@@ -235,6 +271,44 @@ def test_healthz_needs_no_auth(
     client, _con = client_and_con
     resp = client.get("/healthz")
     assert resp.status_code == 200 and resp.text == "ok"
+
+
+def test_readyz_ok(
+    client_and_con: tuple[TestClient, duckdb.DuckDBPyConnection],
+) -> None:
+    client, _con = client_and_con
+    resp = client.get("/readyz")
+    assert resp.status_code == 200 and resp.text == "ok"
+
+
+def test_readyz_503_on_closed_connection() -> None:
+    con = duckdb.connect(":memory:")
+    con.execute(_SCHEMA)
+    app = build_app(con, threading.Lock(), _CFG)
+    client = TestClient(app)
+    con.close()
+    resp = client.get("/readyz")
+    assert resp.status_code == 503 and resp.text == "db not ready"
+
+
+def test_metrics_endpoint_serves_text(
+    client_and_con: tuple[TestClient, duckdb.DuckDBPyConnection],
+) -> None:
+    client, _con = client_and_con
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert "scrooge_ingest_requests_total" in resp.text
+
+
+def test_app_without_token_serves_probes_but_not_ingest() -> None:
+    con = duckdb.connect(":memory:")
+    con.execute(_SCHEMA)
+    client = TestClient(build_app(con, threading.Lock(), IngestConfig(token=None)))
+    assert client.post("/logs", content=b"[]").status_code == 404
+    for path in ("/healthz", "/readyz", "/metrics"):
+        assert client.get(path).status_code == 200
+    con.close()
 
 
 # --- socket-level tests: exercise the real uvicorn server over a TCP socket ---

@@ -1,9 +1,11 @@
-"""HTTP ingest endpoint for Fluent Bit's `http` output.
+"""HTTP server: log ingest for Fluent Bit's `http` output, probes, and metrics.
 
 Fluent Bit can't speak the Quack protocol, so this exposes a small Starlette app (run by
 uvicorn in a dedicated thread) that accepts log records over HTTP and inserts them into the
 same `logs` table that daffy/Quack and retention feed. Records map onto the canonical
-columns; the full original record is preserved in `fields`.
+columns; the full original record is preserved in `fields`. The app also serves the
+`/healthz`/`/readyz` probes and Prometheus `/metrics`, which stay up even when ingest is
+disabled (no token).
 
 The parsing and mapping helpers are pure functions so they can be tested without a server
 or a database.
@@ -11,6 +13,7 @@ or a database.
 
 from __future__ import annotations
 
+import collections
 import hmac
 import json
 import logging
@@ -22,12 +25,14 @@ from typing import Any
 
 import duckdb
 import uvicorn
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
+from scrooge import metrics
 from scrooge.retention import COLUMNS
 
 logger = logging.getLogger("scrooge.ingest")
@@ -54,20 +59,22 @@ class IngestError(RuntimeError):
 
 @dataclass(frozen=True)
 class IngestConfig:
-    """Configuration for the HTTP ingest endpoint.
+    """Configuration for the HTTP server (probes, metrics, and log ingest).
 
-    The endpoint is enabled only when `token` is set. `service_label_key`, `message_key`,
-    and `date_key` select where each record's service identity, message, and timestamp come
-    from; their defaults match the Kubernetes filter + Fluent Bit `http` output conventions.
+    The ingest route is registered only when `token` is set; the probe and metrics
+    routes are always served. `service_label_key`, `message_key`, and `date_key` select
+    where each record's service identity, message, and timestamp come from; their
+    defaults match the Kubernetes filter + Fluent Bit `http` output conventions.
     """
 
-    token: str
+    token: str | None
     host: str = DEFAULT_INGEST_HOST
     port: int = DEFAULT_INGEST_PORT
     path: str = DEFAULT_INGEST_PATH
     service_label_key: str = DEFAULT_SERVICE_LABEL_KEY
     message_key: str = DEFAULT_MESSAGE_KEY
     date_key: str = DEFAULT_DATE_KEY
+    access_log: bool = False
 
 
 def parse_body(body: bytes) -> list[dict[str, Any]]:
@@ -206,23 +213,31 @@ def build_app(
     lock: threading.Lock,
     cfg: IngestConfig,
 ) -> Starlette:
-    """Build the Starlette app: `POST <path>` ingests, `GET /healthz` is an unauthed probe."""
+    """Build the Starlette app: probes and metrics always; `POST <path>` when a token is set.
+
+    `GET /healthz`, `GET /readyz`, and `GET /metrics` are unauthenticated — the port must
+    be restricted to cluster-internal traffic (see the README's deployment security notes).
+    """
     expected = f"Bearer {cfg.token}".encode()
 
     async def ingest(request: Request) -> Response:
         if not authorized(request.headers.get("authorization", ""), expected):
+            metrics.INGEST_REQUESTS.labels("unauthorized").inc()
             return Response(status_code=401)
         body = await request.body()
         try:
             records = parse_body(body)
             mapped = [map_record(r, cfg) for r in records]
         except ValueError as exc:  # BadPayload and any mapping error
+            metrics.INGEST_REQUESTS.labels("bad_payload").inc()
             return PlainTextResponse(f"bad payload: {exc}", status_code=400)
         if not mapped:
+            metrics.INGEST_REQUESTS.labels("empty").inc()
             return Response(status_code=204)
         try:
             await run_in_threadpool(insert_records, conn, lock, mapped)
         except duckdb.Error as exc:
+            metrics.INGEST_REQUESTS.labels("error").inc()
             logger.warning(
                 "ingest insert failed (%d rows); Fluent Bit will retry. Probable cause: "
                 "a DuckDB error or write conflict with a concurrent sweep/append. (%s)",
@@ -230,21 +245,47 @@ def build_app(
                 exc,
             )
             return PlainTextResponse("insert failed", status_code=500)
+        metrics.INGEST_REQUESTS.labels("ok").inc()
+        for service, count in collections.Counter(r["service"] for r in mapped).items():
+            metrics.INGEST_ROWS.labels(service).inc(count)
         return Response(status_code=204)
 
     async def health(_request: Request) -> Response:
         # Liveness only: confirms the HTTP server is up. Intentionally does not probe the
         # DB — a DB-dependent liveness check on the embedded DuckDB would risk restart
-        # loops on a transient hiccup. Wire a readiness probe separately if depooling is
-        # needed.
+        # loops on a transient hiccup; /readyz covers depooling.
         return PlainTextResponse("ok")
 
-    return Starlette(
-        routes=[
-            Route(cfg.path, ingest, methods=["POST"]),
-            Route("/healthz", health, methods=["GET"]),
-        ]
-    )
+    def _check_db() -> None:
+        with lock:
+            conn.execute("SELECT 1")
+
+    async def ready(_request: Request) -> Response:
+        # Readiness = the shared DB connection can execute a query, so a 503 depools the
+        # pod and Fluent Bit fails over to buffering/retry. Deliberately does not check
+        # iRODS: an unreachable archive must not depool ingest (sweeps already tolerate it).
+        try:
+            await run_in_threadpool(_check_db)
+        except Exception as exc:
+            logger.warning(
+                "readiness check failed; probable cause: the DuckDB connection is "
+                "unusable (database invalidated or closed). (%s)",
+                exc,
+            )
+            return PlainTextResponse("db not ready", status_code=503)
+        return PlainTextResponse("ok")
+
+    async def metrics_route(_request: Request) -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    routes = [
+        Route("/healthz", health, methods=["GET"]),
+        Route("/readyz", ready, methods=["GET"]),
+        Route("/metrics", metrics_route, methods=["GET"]),
+    ]
+    if cfg.token is not None:
+        routes.append(Route(cfg.path, ingest, methods=["POST"]))
+    return Starlette(routes=routes)
 
 
 def serve_in_thread(
@@ -257,27 +298,38 @@ def serve_in_thread(
     bind failure (e.g. the port is in use) raises `IngestError` here instead of dying
     silently in the thread while the caller believes the endpoint is up.
     """
-    config = uvicorn.Config(app, host=cfg.host, port=cfg.port, log_level="warning")
+    # log_level must rise with access_log: at "warning" uvicorn silences the
+    # uvicorn.access logger regardless of the access_log flag.
+    config = uvicorn.Config(
+        app,
+        host=cfg.host,
+        port=cfg.port,
+        access_log=cfg.access_log,
+        log_level="info" if cfg.access_log else "warning",
+    )
     server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, name="scrooge-ingest", daemon=True)
+    thread = threading.Thread(target=server.run, name="scrooge-http", daemon=True)
     thread.start()
 
     waited = 0.0
     while not server.started:
         if not thread.is_alive():
             raise IngestError(
-                f"ingest server failed to start on {cfg.host}:{cfg.port} "
+                f"HTTP server failed to start on {cfg.host}:{cfg.port} "
                 "(port already in use?)"
             )
         if waited >= 5.0:
             server.should_exit = True
             raise IngestError(
-                f"ingest server did not start within 5s on {cfg.host}:{cfg.port}"
+                f"HTTP server did not start within 5s on {cfg.host}:{cfg.port}"
             )
         time.sleep(0.05)
         waited += 0.05
 
     logger.info(
-        "ingest endpoint serving on http://%s:%d%s", cfg.host, cfg.port, cfg.path
+        "http endpoint serving on http://%s:%d (ingest: %s)",
+        cfg.host,
+        cfg.port,
+        cfg.path if cfg.token is not None else "disabled",
     )
     return server, thread

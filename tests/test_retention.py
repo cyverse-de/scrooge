@@ -6,6 +6,7 @@ from pathlib import Path
 import duckdb
 import fsspec
 import pytest
+from prometheus_client import REGISTRY
 
 from scrooge.retention import (
     _ensure_pending_table,
@@ -171,11 +172,18 @@ def test_export_day_removes_orphan_on_delete_failure(tmp_path: Path) -> None:
 
 
 def test_export_day_clears_marker_on_success(tmp_path: Path) -> None:
+    def metric(name: str) -> float:
+        return REGISTRY.get_sample_value(name, {"service": "svc"}) or 0.0
+
     fs = fsspec.filesystem("file")
     con = _seeded(":memory:", {"svc": [("2026-06-01", 2)]})
+    files_before = metric("scrooge_archive_files_total")
+    bytes_before = metric("scrooge_archive_bytes_total")
     export_day(con, fs, str(tmp_path), "svc", date(2026, 6, 1))
     assert _pending_urls(con) == []
     assert _live_total(con) == 0
+    assert metric("scrooge_archive_files_total") == files_before + 1
+    assert metric("scrooge_archive_bytes_total") > bytes_before
 
 
 @pytest.mark.parametrize(
