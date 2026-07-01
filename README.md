@@ -6,11 +6,8 @@ the [Quack protocol](https://duckdb.org/docs/current/quack/overview), and rolls 
 logs out to [Parquet](https://parquet.apache.org/) in [iRODS](https://irods.org) so the
 live table stays bounded.
 
-> **Status: proof of concept — not production-ready.** scrooge is an early prototype under
-> active development. It has been exercised end-to-end against a live iRODS deployment and
-> real Fluent Bit and Quack clients, but it has not been hardened, performance-tuned, or
-> stabilized for production use; configuration and behavior may change without notice. Use
-> it for evaluation and experimentation only.
+> **Note:** the Quack protocol itself is a beta DuckDB feature (stable targeted for
+> v2.0.0), so protocol behavior may change with DuckDB releases.
 
 ## What it does
 

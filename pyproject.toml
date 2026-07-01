@@ -39,4 +39,4 @@ venv = ".venv"
 testpaths = ["tests"]
 
 [tool.uv.sources]
-ducktape = { git = "https://github.com/cyverse-de/ducktape.git" }
+ducktape = { git = "https://github.com/cyverse-de/ducktape.git", tag = "v0.2.0" }
