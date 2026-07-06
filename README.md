@@ -304,6 +304,27 @@ uv run ruff format --check
 uv run pyright
 ```
 
+### Integration tests
+
+The default `uv run pytest` run is hermetic and skips the `integration` marker. The
+integration suite (`tests/integration/`) spawns a real `scrooge` process and drives both
+ingest paths end to end — the Quack protocol using the real
+[daffy](https://github.com/cyverse-de/daffy) code, plus the HTTP endpoint — reading results
+back over Quack. daffy comes from the `integration` dependency group (pinned in
+`[tool.uv.sources]`), so pass `--group integration`:
+
+```bash
+uv run --group integration pytest -m integration -s
+```
+
+The archival test self-skips unless `SCROOGE_IT_IRODS` is set with iRODS credentials in the
+environment; it writes to (and cleans up) a unique collection under your iRODS home:
+
+```bash
+set -a; source .env.test
+SCROOGE_IT_IRODS=1 uv run --group integration pytest -m integration -k archival -s
+```
+
 ### Upgrading ducktape
 
 The [ducktape](https://github.com/cyverse-de/ducktape) dependency is pinned to a release

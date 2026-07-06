@@ -29,6 +29,27 @@ jobs:
       - name: Type check
         run: uv run pyright
 
-      # The suite is hermetic: local-filesystem fsspec and local DuckDB, no iRODS needed.
+      # The default suite is hermetic (local DuckDB, no iRODS, no daffy): addopts deselects
+      # the `integration` marker, and tests/integration is skipped since daffy isn't present.
       - name: Test
         run: uv run pytest
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # The `integration` group pulls daffy (the Quack ingest driver) from git.
+      - name: Sync dependencies
+        run: uv sync --dev --group integration
+
+      # Spawns a live scrooge process and drives Quack + HTTP ingest. The iRODS archival
+      # test self-skips unless SCROOGE_IT_IRODS (and iRODS creds) are provided as secrets.
+      - name: Integration tests
+        run: uv run --group integration pytest -m integration
