@@ -42,7 +42,13 @@ venv = ".venv"
 # and so isn't present in the hermetic env pyright runs in; they're exercised at runtime,
 # not type-checked. The first three entries are pyright's defaults (restated because setting
 # `exclude` replaces them — `**/.*` is what keeps `.venv` out of analysis).
-exclude = ["**/node_modules", "**/__pycache__", "**/.*", "tests/integration/test_*.py"]
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "tests/integration/test_*.py",
+    "tests/integration/_daffy.py",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

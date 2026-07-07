@@ -6,15 +6,13 @@ import json
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
 import duckdb
 import pytest
 
+from _daffy import daffy_config, make_records, ship_records
 from conftest import ScroogeServer, ServerFactory
 
-from daffy.config import Config
-from daffy.schema import LogRecord
 from daffy.shipper import Shipper
 from daffy.store import LogStore
 
@@ -22,31 +20,6 @@ pytestmark = pytest.mark.integration
 
 Reader = Callable[[ScroogeServer], duckdb.DuckDBPyConnection]
 Poster = Callable[..., tuple[int, str]]
-
-
-def _config(server: ScroogeServer, **overrides: object) -> Config:
-    base: dict[str, object] = {
-        "service": "edge",
-        "local_db": ":memory:",
-        "pod": None,
-        "node": None,
-        "scrooge_uri": server.quack_uri,
-        "scrooge_token": server.quack_token,
-        "flush_rows": 10_000,
-        "flush_interval": 5.0,
-        "max_buffer_rows": 1_000_000,
-    }
-    base.update(overrides)
-    return Config(**base)  # type: ignore[arg-type]
-
-
-def _ship(server: ScroogeServer, records: list[LogRecord]) -> int:
-    store = LogStore(":memory:")
-    store.insert_many(records)
-    try:
-        return Shipper(_config(server), store).flush()
-    finally:
-        store.close()
 
 
 @pytest.mark.parametrize(
@@ -121,16 +94,10 @@ def test_concurrent_mixed_ingest(
     http_workers = 4
 
     def ship_batch(worker: int) -> None:
-        records = [
-            LogRecord(
-                capture_time=datetime(2026, 6, 22, 0, 0, worker, i),
-                service=f"quack-{worker}",
-                stream="stdout",
-                message=f"q-{worker}-{i}",
-            )
-            for i in range(per_worker)
-        ]
-        assert _ship(scrooge, records) == per_worker
+        records = make_records(
+            per_worker, service=f"quack-{worker}", message=f"q-{worker}"
+        )
+        assert ship_records(scrooge, records) == per_worker
 
     def post_batch(worker: int) -> None:
         records = [
@@ -182,21 +149,13 @@ def test_daffy_reconnect_after_downtime(
     server = scrooge_factory(db_path=db_path, quack_port=quack_port)
 
     store = LogStore(":memory:")
-    shipper = Shipper(_config(server), store)
+    shipper = Shipper(daffy_config(server), store)
 
-    first = [
-        LogRecord(datetime(2026, 6, 22, 0, 0, 0, i), "recon", "stdout", f"pre-{i}")
-        for i in range(20)
-    ]
-    store.insert_many(first)
+    store.insert_many(make_records(20, service="recon", message="pre"))
     assert shipper.flush() == 20  # server up: delivered
 
     stop_server(server)
-    second = [
-        LogRecord(datetime(2026, 6, 22, 0, 0, 1, i), "recon", "stdout", f"post-{i}")
-        for i in range(15)
-    ]
-    store.insert_many(second)
+    store.insert_many(make_records(15, service="recon", message="post"))
     assert shipper.flush() == 0  # server down: retained, nothing shipped
     assert store.count() == 15
 

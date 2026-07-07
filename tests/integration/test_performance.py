@@ -10,15 +10,13 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
 import duckdb
 import pytest
 
+from _daffy import daffy_config, make_records, ship_records
 from conftest import ScroogeServer
 
-from daffy.config import Config
-from daffy.schema import LogRecord
 from daffy.shipper import Shipper
 from daffy.store import LogStore
 
@@ -31,32 +29,6 @@ Poster = Callable[..., tuple[int, str]]
 # something is hung or pathologically slow, not merely a slow CI box.
 MAX_INGEST_SECONDS = 120.0
 MAX_QUERY_SECONDS = 15.0
-
-
-def _config(server: ScroogeServer) -> Config:
-    return Config(
-        service="perf",
-        local_db=":memory:",
-        pod=None,
-        node=None,
-        scrooge_uri=server.quack_uri,
-        scrooge_token=server.quack_token,
-        flush_rows=1_000_000,
-        flush_interval=60.0,
-        max_buffer_rows=2_000_000,
-    )
-
-
-def _records(count: int, *, service: str = "perf") -> list[LogRecord]:
-    return [
-        LogRecord(
-            capture_time=datetime(2026, 6, 22, 0, 0, 0, i % 1_000_000),
-            service=service,
-            stream="stdout",
-            message=f"perf-{i}",
-        )
-        for i in range(count)
-    ]
 
 
 def _post_bulk(
@@ -74,8 +46,8 @@ def _post_bulk(
 def test_quack_ingest_throughput(scrooge: ScroogeServer, quack_reader: Reader) -> None:
     total = 20_000
     store = LogStore(":memory:")
-    store.insert_many(_records(total))
-    shipper = Shipper(_config(scrooge), store)
+    store.insert_many(make_records(total, service="perf"))
+    shipper = Shipper(daffy_config(scrooge), store)
 
     started = time.perf_counter()
     shipped = shipper.flush()
@@ -120,12 +92,8 @@ def test_mixed_concurrent_throughput(
     total = (quack_workers + http_workers) * per_worker
 
     def ship(worker: int) -> None:
-        store = LogStore(":memory:")
-        store.insert_many(_records(per_worker, service=f"q-{worker}"))
-        try:
-            assert Shipper(_config(scrooge), store).flush() == per_worker
-        finally:
-            store.close()
+        records = make_records(per_worker, service=f"q-{worker}")
+        assert ship_records(scrooge, records) == per_worker
 
     def post(worker: int) -> None:
         records = [

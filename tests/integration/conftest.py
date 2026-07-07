@@ -29,6 +29,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from scrooge.retention import sql_literal
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The integration test modules import daffy directly. When the `integration` group isn't
@@ -52,10 +54,20 @@ CALL quack_serve('quack:127.0.0.1:{port}', allow_other_hostname => true, token =
 """
 
 
+def _free_ports(count: int) -> list[int]:
+    """Reserve `count` distinct ephemeral ports, held at once so two can't come back equal."""
+    socks = [socket.socket() for _ in range(count)]
+    try:
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        return [int(s.getsockname()[1]) for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+
+
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    return _free_ports(1)[0]
 
 
 def _load_quack(conn: duckdb.DuckDBPyConnection) -> None:
@@ -64,10 +76,6 @@ def _load_quack(conn: duckdb.DuckDBPyConnection) -> None:
     except duckdb.Error:
         conn.execute("INSTALL quack")
         conn.execute("LOAD quack")
-
-
-def _sql_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 @dataclass(slots=True)
@@ -95,8 +103,8 @@ class ScroogeServer:
         except duckdb.Error:
             pass
         conn.execute(
-            f"ATTACH {_sql_literal(self.quack_uri)} AS {name} "
-            f"(TOKEN {_sql_literal(self.quack_token)})"
+            f"ATTACH {sql_literal(self.quack_uri)} AS {name} "
+            f"(TOKEN {sql_literal(self.quack_token)})"
         )
 
 
@@ -120,12 +128,17 @@ def _quack_ready(server: ScroogeServer) -> bool:
         conn.close()
 
 
+class _StartupError(RuntimeError):
+    """scrooge exited during startup — typically a port bind conflict, so worth retrying."""
+
+
 def _wait_ready(server: ScroogeServer) -> None:
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         if server.proc.poll() is not None:
-            raise RuntimeError(
-                f"scrooge exited early with code {server.proc.returncode} during startup"
+            raise _StartupError(
+                f"scrooge exited early with code {server.proc.returncode} during startup "
+                "(likely a port bind conflict)"
             )
         if _readyz(server.http_base) and _quack_ready(server):
             return
@@ -158,50 +171,69 @@ def scrooge_factory(tmp_path: Path) -> Iterator[ServerFactory]:
         extra_env: Mapping[str, str] | None = None,
     ) -> ScroogeServer:
         nonlocal counter
-        counter += 1
-        quack_port = quack_port if quack_port is not None else _free_port()
-        http_port = http_port if http_port is not None else _free_port()
-        boot_sql = tmp_path / f"boot-{counter}.sql"
-        boot_sql.write_text(_BOOT_SQL.format(port=quack_port))
-        db = db_path if db_path is not None else tmp_path / f"scrooge-{counter}.duckdb"
+        # A reserved port can be taken between release and scrooge's bind (and a caller may
+        # pin one across a restart), so retry a few times on an early bind failure. Unpinned
+        # ports are re-reserved each attempt; the short delay lets a just-freed port clear.
+        last_error: _StartupError | None = None
+        for _ in range(3):
+            counter += 1
+            if quack_port is None and http_port is None:
+                # Reserved together so the two can never come back as the same port.
+                qp, hp = _free_ports(2)
+            else:
+                qp = quack_port if quack_port is not None else _free_port()
+                hp = http_port if http_port is not None else _free_port()
+            boot_sql = tmp_path / f"boot-{counter}.sql"
+            boot_sql.write_text(_BOOT_SQL.format(port=qp))
+            db = (
+                db_path
+                if db_path is not None
+                else tmp_path / f"scrooge-{counter}.duckdb"
+            )
 
-        env = os.environ.copy()
-        env.update(
-            {
-                "DUCKDB_DATABASE": str(db),
-                "DUCKDB_BOOT_SQL": str(boot_sql),
-                "QUACK_TOKEN": QUACK_TOKEN,
-                "SCROOGE_INGEST_HOST": "127.0.0.1",
-                "SCROOGE_INGEST_PORT": str(http_port),
-                "SCROOGE_INGEST_PATH": "/logs",
-            }
-        )
-        if ingest_token is not None:
-            env["SCROOGE_INGEST_TOKEN"] = ingest_token
-        else:
-            env.pop("SCROOGE_INGEST_TOKEN", None)
-        if storage_dir is not None:
-            env["SCROOGE_STORAGE_DIR"] = storage_dir
-        else:
-            env.pop("SCROOGE_STORAGE_DIR", None)
-        if extra_env:
-            env.update(extra_env)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DUCKDB_DATABASE": str(db),
+                    "DUCKDB_BOOT_SQL": str(boot_sql),
+                    "QUACK_TOKEN": QUACK_TOKEN,
+                    "SCROOGE_INGEST_HOST": "127.0.0.1",
+                    "SCROOGE_INGEST_PORT": str(hp),
+                    "SCROOGE_INGEST_PATH": "/logs",
+                }
+            )
+            if ingest_token is not None:
+                env["SCROOGE_INGEST_TOKEN"] = ingest_token
+            else:
+                env.pop("SCROOGE_INGEST_TOKEN", None)
+            if storage_dir is not None:
+                env["SCROOGE_STORAGE_DIR"] = storage_dir
+            else:
+                env.pop("SCROOGE_STORAGE_DIR", None)
+            if extra_env:
+                env.update(extra_env)
 
-        proc = subprocess.Popen(["uv", "run", "scrooge"], cwd=REPO_ROOT, env=env)
-        server = ScroogeServer(
-            proc=proc,
-            http_base=f"http://127.0.0.1:{http_port}",
-            quack_uri=f"quack:127.0.0.1:{quack_port}",
-            quack_token=QUACK_TOKEN,
-            ingest_token=ingest_token,
-            db_path=db,
-            boot_sql=boot_sql,
-            quack_port=quack_port,
-            http_port=http_port,
-        )
-        servers.append(server)
-        _wait_ready(server)
-        return server
+            proc = subprocess.Popen(["uv", "run", "scrooge"], cwd=REPO_ROOT, env=env)
+            server = ScroogeServer(
+                proc=proc,
+                http_base=f"http://127.0.0.1:{hp}",
+                quack_uri=f"quack:127.0.0.1:{qp}",
+                quack_token=QUACK_TOKEN,
+                ingest_token=ingest_token,
+                db_path=db,
+                boot_sql=boot_sql,
+                quack_port=qp,
+                http_port=hp,
+            )
+            servers.append(server)
+            try:
+                _wait_ready(server)
+                return server
+            except _StartupError as exc:
+                last_error = exc
+                _stop(server)
+                time.sleep(0.5)
+        raise last_error or RuntimeError("scrooge failed to start")
 
     yield _launch
 

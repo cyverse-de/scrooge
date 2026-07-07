@@ -12,12 +12,8 @@ from datetime import datetime
 import duckdb
 import pytest
 
+from _daffy import make_records, ship_records
 from conftest import ScroogeServer
-
-from daffy.config import Config
-from daffy.schema import LogRecord
-from daffy.shipper import Shipper
-from daffy.store import LogStore
 
 pytestmark = pytest.mark.integration
 
@@ -25,41 +21,8 @@ Reader = Callable[[ScroogeServer], duckdb.DuckDBPyConnection]
 Poster = Callable[..., tuple[int, str]]
 
 
-def _records(n: int, *, service: str, message: str = "hello") -> list[LogRecord]:
-    return [
-        LogRecord(
-            capture_time=datetime(2026, 6, 22, 0, 0, 0, i),
-            service=service,
-            stream="stdout",
-            message=f"{message}-{i}",
-        )
-        for i in range(n)
-    ]
-
-
-def _ship(server: ScroogeServer, records: list[LogRecord]) -> int:
-    """Ship records into a live scrooge using daffy's real Shipper over Quack."""
-    store = LogStore(":memory:")
-    store.insert_many(records)
-    config = Config(
-        service="shipper",
-        local_db=":memory:",
-        pod=None,
-        node=None,
-        scrooge_uri=server.quack_uri,
-        scrooge_token=server.quack_token,
-        flush_rows=10_000,
-        flush_interval=5.0,
-        max_buffer_rows=100_000,
-    )
-    try:
-        return Shipper(config, store).flush()
-    finally:
-        store.close()
-
-
 def test_daffy_quack_library(scrooge: ScroogeServer, quack_reader: Reader) -> None:
-    shipped = _ship(scrooge, _records(50, service="svc-a"))
+    shipped = ship_records(scrooge, make_records(50, service="svc-a"))
     assert shipped == 50
 
     conn = quack_reader(scrooge)
@@ -158,7 +121,7 @@ def test_http_rest_fluentbit_shape(
 def test_cross_encoder_one_table(
     scrooge: ScroogeServer, quack_reader: Reader, post_logs: Poster
 ) -> None:
-    assert _ship(scrooge, _records(10, service="svc-quack")) == 10
+    assert ship_records(scrooge, make_records(10, service="svc-quack")) == 10
 
     http_records = [
         {
@@ -192,7 +155,7 @@ def test_cross_encoder_one_table(
 def test_all_logs_view_matches_without_archive(
     scrooge: ScroogeServer, quack_reader: Reader
 ) -> None:
-    _ship(scrooge, _records(5, service="svc-view"))
+    ship_records(scrooge, make_records(5, service="svc-view"))
     conn = quack_reader(scrooge)
     (logs_count,) = conn.execute("SELECT count(*) FROM remote.logs").fetchone()
     (all_count,) = conn.execute("SELECT count(*) FROM remote.all_logs").fetchone()

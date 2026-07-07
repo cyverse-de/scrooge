@@ -18,12 +18,8 @@ import duckdb
 import fsspec
 import pytest
 
+from _daffy import make_records, ship_records
 from conftest import ScroogeServer, ServerFactory
-
-from daffy.config import Config
-from daffy.schema import LogRecord
-from daffy.shipper import Shipper
-from daffy.store import LogStore
 
 pytestmark = [
     pytest.mark.integration,
@@ -37,8 +33,10 @@ Reader = Callable[[ScroogeServer], duckdb.DuckDBPyConnection]
 Poster = Callable[..., tuple[int, str]]
 
 RETENTION = 500
+# OLD_DAY is tz-aware because .timestamp() below needs true UTC; NEW_DAY is the naive base
+# for daffy capture_times and must be a later day so the old day is the one that rolls off.
 OLD_DAY = datetime(2026, 6, 20, tzinfo=UTC)
-NEW_DAY = datetime(2026, 6, 22, tzinfo=UTC)
+NEW_DAY = datetime(2026, 6, 22)
 OLD_ROWS = 800
 NEW_ROWS = 300
 SERVICE = "arch-svc"
@@ -56,33 +54,8 @@ def _irods_options() -> dict[str, object]:
 
 
 def _ship_new_day(server: ScroogeServer) -> None:
-    store = LogStore(":memory:")
-    store.insert_many(
-        [
-            LogRecord(
-                capture_time=NEW_DAY.replace(tzinfo=None, microsecond=i % 1_000_000),
-                service=SERVICE,
-                stream="stdout",
-                message=f"new-{i}",
-            )
-            for i in range(NEW_ROWS)
-        ]
-    )
-    config = Config(
-        service=SERVICE,
-        local_db=":memory:",
-        pod=None,
-        node=None,
-        scrooge_uri=server.quack_uri,
-        scrooge_token=server.quack_token,
-        flush_rows=1_000_000,
-        flush_interval=60.0,
-        max_buffer_rows=1_000_000,
-    )
-    try:
-        assert Shipper(config, store).flush() == NEW_ROWS
-    finally:
-        store.close()
+    records = make_records(NEW_ROWS, service=SERVICE, message="new", base=NEW_DAY)
+    assert ship_records(server, records) == NEW_ROWS
 
 
 def _post_old_day(server: ScroogeServer, post_logs: Poster) -> None:
@@ -123,14 +96,20 @@ def test_archival_to_irods(
         _ship_new_day(server)
         conn = quack_reader(server)
 
-        # Wait for a sweep to archive the older day and rebuild the view.
+        # Wait for a sweep to archive the older day and rebuild the view. A query can land
+        # mid-sweep — while refresh_view swaps the all_logs view or a parquet is still being
+        # written — and raise; treat that as "not settled yet" and keep polling.
         deadline = time.monotonic() + 45.0
         live = all_rows = -1
         while time.monotonic() < deadline:
-            (live,) = conn.execute("SELECT count(*) FROM remote.logs").fetchone()
-            (all_rows,) = conn.execute(
-                "SELECT count(*) FROM remote.all_logs"
-            ).fetchone()
+            try:
+                (live,) = conn.execute("SELECT count(*) FROM remote.logs").fetchone()
+                (all_rows,) = conn.execute(
+                    "SELECT count(*) FROM remote.all_logs"
+                ).fetchone()
+            except duckdb.Error:
+                time.sleep(1.0)
+                continue
             if live <= RETENTION and all_rows == OLD_ROWS + NEW_ROWS:
                 break
             time.sleep(1.0)

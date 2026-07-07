@@ -49,7 +49,8 @@ jobs:
       - name: Sync dependencies
         run: uv sync --dev --group integration
 
-      # Spawns a live scrooge process and drives Quack + HTTP ingest. The iRODS archival
-      # test self-skips unless SCROOGE_IT_IRODS (and iRODS creds) are provided as secrets.
+      # Spawns a live scrooge process and drives Quack + HTTP ingest. Excludes `slow` (the
+      # 20k/50k-row perf tests — run those locally); the iRODS archival test self-skips
+      # unless SCROOGE_IT_IRODS (and iRODS creds) are provided as secrets.
       - name: Integration tests
-        run: uv run --group integration pytest -m integration
+        run: uv run --group integration pytest -m "integration and not slow"
