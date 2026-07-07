@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-import httpx
+import httpx2
 import pytest
 from prometheus_client import REGISTRY
 from starlette.testclient import TestClient
@@ -338,17 +338,17 @@ def test_live_server_ingests_over_socket(
     live_server: tuple[duckdb.DuckDBPyConnection, str],
 ) -> None:
     con, base = live_server
-    resp = httpx.post(
+    resp = httpx2.post(
         f"{base}/logs", content=json.dumps([_FULL_RECORD]).encode(), headers=_GOOD_AUTH
     )
     assert resp.status_code == 204
     row = con.execute("SELECT service, message, capture_time FROM logs").fetchone()
     assert row == ("svc", "hello world", datetime(2025, 1, 1))
 
-    health = httpx.get(f"{base}/healthz")
+    health = httpx2.get(f"{base}/healthz")
     assert health.status_code == 200 and health.text == "ok"
 
-    bad = httpx.post(
+    bad = httpx2.post(
         f"{base}/logs", content=b"[]", headers={"Authorization": "Bearer nope"}
     )
     assert bad.status_code == 401

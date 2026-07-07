@@ -24,19 +24,43 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
+    "httpx2>=2.5.0",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "ruff>=0.15.20",
 ]
+# daffy drives the Quack ingest path in the integration suite. It's isolated in its own
+# group so the default (hermetic) sync and CI job never pull it; enable with
+# `uv run --group integration pytest -m integration`.
+integration = ["daffy"]
 
 [tool.pyright]
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
+# Integration tests import daffy, which lives only in the `integration` dependency group
+# and so isn't present in the hermetic env pyright runs in; they're exercised at runtime,
+# not type-checked. The first three entries are pyright's defaults (restated because setting
+# `exclude` replaces them — `**/.*` is what keeps `.venv` out of analysis).
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "tests/integration/test_*.py",
+    "tests/integration/_daffy.py",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests/integration"]
+# Keep the default run hermetic and fast; opt in with `-m integration`.
+addopts = "-m 'not integration'"
+markers = [
+    "integration: end-to-end tests that spawn a live scrooge process (needs the `integration` group)",
+    "slow: long-running performance tests",
+]
 
 [tool.uv.sources]
 ducktape = { git = "https://github.com/cyverse-de/ducktape.git", tag = "v0.2.0" }
+# daffy has no release tags yet; pin to a commit so integration runs are reproducible.
+daffy = { git = "https://github.com/cyverse-de/daffy.git", rev = "443becbe9a6eba7fac3f8b21df1744a8ea026ff1" }
