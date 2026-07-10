@@ -61,6 +61,6 @@ markers = [
 ]
 
 [tool.uv.sources]
-ducktape = { git = "https://github.com/cyverse-de/ducktape.git", tag = "v0.2.0" }
+ducktape = { git = "https://github.com/cyverse-de/ducktape.git", tag = "v0.3.0" }
 # daffy has no release tags yet; pin to a commit so integration runs are reproducible.
 daffy = { git = "https://github.com/cyverse-de/daffy.git", rev = "443becbe9a6eba7fac3f8b21df1744a8ea026ff1" }
